@@ -107,6 +107,12 @@ layout)
 	labwc_conf; kill -HUP ${LABWC_PID:-$(pidof labwc)} 2> /dev/null   # = labwc --reconfigure, also from outside the session
 	# the taskbar on the desktop screen
 	P=$HOME/.config/lxqt/panel.conf; [ -f $P ] && sed -i "s/^screen-name=.*/screen-name=$DESK/" $P
+	# lxqt-panel 2.1 (Debian trixie) has no screen-name key: it uses desktop=<screen index>, and Qt numbers the screens in
+	# the order labwc announces its outputs - which wlr-randr lists the other way round (2026-11-08 on the Duo: wlr-randr
+	# DSI-2, DSI-1; desktop=1 = DSI-2). Without this the panel sat under the keyboard on the other screen.
+	OUTS=$(wlr-randr 2>/dev/null | sed -n 's/^\([A-Za-z0-9-]*\) ".*/\1/p'); N=$(echo "$OUTS" | grep -c .)
+	DI=$(echo "$OUTS" | grep -n -x "$DESK" | cut -d: -f1)
+	[ -f $P ] && [ -n "$DI" ] && sed -i "s/^desktop=.*/desktop=$((N - DI))/" $P
 	# the keyboard FIRST: pcmanfm-qt puts desktop icons on every screen until the keyboard covers its screen
 	HINGEBOARD_SESSION=desktop HINGEBOARD_OUTPUT=$KB HINGEBOARD_OTHER=$DESK HINGEBOARD_ROTATE=$KB_ROT HINGEBOARD_OTHER_TOUCH=$(id_of "$DESK_TOUCH") HINGEBOARD_RAW_TOUCH="$KB_TOUCH" \
 		setsid hingeboard > /tmp/hingeboard.log 2>&1 < /dev/null &

@@ -120,6 +120,15 @@ link_color=#6aa6ff
 link_visited_color=#b08cff
 EOF
 printf '[General]\n__userfile__=true\nenableBatteryWatcher=true\npowerLowAction=0\nenableIdlenessWatcher=false\nenableLidWatcher=false\nshowIcon=true\nuseThemeIcons=true\n' > $H/.config/lxqt/lxqt-powermanagement.conf
+# quick-launch: the file manager + whichever terminal / browser this distribution has (pmOS: foot, Epiphany; Debian:
+# konsole, chromium) - lxqt-panel drops a launcher whose .desktop file is missing
+pick() { for d in "$@"; do [ -f $R/usr/share/applications/$d ] && { echo /usr/share/applications/$d; return; }; done; }
+QL1=/usr/share/applications/pcmanfm-qt.desktop
+QL2=$(pick foot.desktop org.kde.konsole.desktop qterminal.desktop)
+QL3=$(pick org.gnome.Epiphany.desktop chromium.desktop firefox-esr.desktop firefox.desktop)
+# the start-menu icon: LXQt's own needs lxqt-themes; use the theme's start-here (Breeze has start-here-kde)
+MI=$(ls $R/usr/share/icons/breeze-dark/places/96/start-here-kde.svg $R/usr/share/icons/*/places/*/start-here.svg 2>/dev/null | head -1)
+MI=${MI#$R}
 cat > $H/.config/lxqt/panel.conf <<EOF
 [General]
 __userfile__=true
@@ -127,7 +136,7 @@ __userfile__=true
 [panel1]
 alignment=-1
 animation-duration=0
-desktop=0
+desktop=${HINGEBOARD_OTHER_INDEX:-1}
 hidable=false
 iconSize=24
 lineCount=1
@@ -142,13 +151,14 @@ width-percent=true
 
 [fancymenu]
 type=fancymenu
+icon=$MI
 
 [quicklaunch]
 type=quicklaunch
 alignment=Left
-apps\\1\\desktop=/usr/share/applications/pcmanfm-qt.desktop
-apps\\2\\desktop=/usr/share/applications/foot.desktop
-apps\\3\\desktop=/usr/share/applications/org.gnome.Epiphany.desktop
+apps\\1\\desktop=$QL1
+apps\\2\\desktop=$QL2
+apps\\3\\desktop=$QL3
 apps\\size=3
 
 [taskbar]

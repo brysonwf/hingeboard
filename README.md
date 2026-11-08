@@ -15,6 +15,10 @@ names and touch devices are settings, so other dual-screen devices can use it.
   - Standard laptop layout, latching Shift / Ctrl / Alt / Super, Caps Lock, hold to repeat.
   - Gamepad mode: D-pad, A B X Y, L R, Select / Start as a virtual gamepad, multi-touch.
   - Microphone key: offline dictation with Vosk (`hingeboard-dictate.py`); nothing leaves the device.
+  - Top bar: left click, right click, microphone and a **settings** button. Settings opens the rarer buttons in the
+    same bar (gamepad, swap, flip, screens, media, phone/exit) and hides the click and microphone buttons; tap it
+    again to close. **Media** turns the bar into player controls: previous, play/pause, next (any MPRIS player, via
+    playerctl) and volume down / up (PipeWire, via wpctl).
   - Exit puts both screens back to phone mode.
 - **Display modes** (`hingeboard-display-mode keyboard|phone`): while the keyboard runs, the other screen becomes
   Phosh's primary display in landscape.
@@ -36,15 +40,18 @@ names and touch devices are settings, so other dual-screen devices can use it.
 
 postmarketOS (Alpine) with Phosh. Packages:
 
-    apk add py3-gobject3 py3-cairo py3-evdev gtk4-layer-shell wlr-randr doas
+    apk add py3-gobject3 py3-cairo py3-evdev gtk4-layer-shell wlr-randr doas playerctl
     apk add labwc lxqt-panel pcmanfm-qt lxqt-powermanagement breeze-icons wl-mirror   # laptop session
     apk add py3-vosk-api vosk-model-small-en-us                                # dictation (optional)
 
 Debian (trixie or newer, tested with Plasma Mobile on the Surface Duo):
 
     apt install python3-gi python3-gi-cairo python3-cairo python3-evdev gir1.2-gtk-4.0 \
-        gir1.2-gtk4layershell-1.0 libgtk4-layer-shell0 wlr-randr opendoas
-    apt install labwc lxqt-panel pcmanfm-qt wl-mirror                          # laptop session
+        gir1.2-gtk4layershell-1.0 libgtk4-layer-shell0 wlr-randr opendoas playerctl
+    apt install labwc lxqt-panel pcmanfm-qt wl-mirror gvfs                     # laptop session
+
+(lxqt-panel 2.1, as in trixie, places itself by screen index (`desktop=`) rather than `screen-name`; install.sh and
+the session write both.)
 
 (The keyboard preloads gtk4-layer-shell itself; on Debian the library is in the multiarch directory.)
 

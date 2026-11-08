@@ -201,7 +201,19 @@ class App(Gtk.ApplicationWindow):
         bar = bar0 + wr + h * (0.025 if wins else 0.02)   # small gap under the bar / window row
         # laptop session: swap (keyboard <-> desktop screen), flip (both upside down), screens (only with a TV)
         extra = ([("", "swap"), ("", "flip")] if IN_DESKTOP else []) + ([("", "screens")] if getattr(self, "ext", False) else [])
-        bar_items = BAR[:-1] + extra + BAR[-1:] if self.mode == "keys" else []
+        # settings button (request 2026-11-08: "move phone, flip, swap, and gamepad into a settings button. when the
+        # settings button is clicked hide mic and click buttons"): closed = clicks + mic + settings; open = the mode
+        # switch (gamepad), swap, flip, screens, phone + settings (tap again to close)
+        # media (request 2026-11-08: "Inside of the settings button let's add another button for media player
+        # controls"): settings -> media = previous, play/pause, next, volume down / up + back to settings
+        if self.mode != "keys":
+            bar_items = []
+        elif getattr(self, "settings", False) == "media":
+            bar_items = [("", "m-prev"), ("", "m-play"), ("", "m-next"), ("", "m-voldown"), ("", "m-volup"), ("", "settings")]
+        elif getattr(self, "settings", False):
+            bar_items = [b for b in BAR if b[1] == "toggle"] + extra + [("", "media")] + BAR[-1:] + [("", "settings")]
+        else:
+            bar_items = [b for b in BAR[:-1] if b[1] != "toggle"] + [("", "settings")]
         bw = w / max(1, len(bar_items))
         for i, (lab, act) in enumerate(bar_items):
             if act == "toggle": lab = ""          # drawn as a symbol (draw_icon): the mode a tap goes TO
@@ -302,12 +314,16 @@ class App(Gtk.ApplicationWindow):
                 cr.show_text(lab); continue
             if kind == "bar":                            # the top bar: icons only, no outline; a soft grey while pressed
                 st = getattr(self, "dict_state", None) if code == "mic" else None
+                if code == "settings" and getattr(self, "settings", False) and not down:   # open: a soft grey behind
+                    rrect(cr, x, y, iw, ih, 8); cr.set_source_rgb(0.16, 0.17, 0.20); cr.fill()
                 if down or st:                           # mic: orange = loading the model, red = listening
                     rrect(cr, x, y, iw, ih, 8)
                     cr.set_source_rgb(*((0.85, 0.20, 0.18) if st == "listening" else (0.95, 0.55, 0.10) if st
                                         else (0.16, 0.17, 0.20))); cr.fill()
                 self.draw_icon(cr, x, y, iw, ih, {"lclick": "mouse-l", "rclick": "mouse", "exit": "phone", "mic": "mic",
-                                                  "enter": "enter", "swap": "swap", "flip": "flip",
+                                                  "enter": "enter", "swap": "swap", "flip": "flip", "settings": "gear",
+                                                  "media": "note", "m-prev": "prev", "m-play": "playpause",
+                                                  "m-next": "next", "m-voldown": "vol-", "m-volup": "vol+",
                                                   "notouch": "lock" if getattr(self, "notouch", False) else "unlock",
                                                   "screens": "screens-tv" if self.screens_mode() == "tv" else "screens"}.get(
                     code, "pad" if self.mode == "keys" else "keys"))
@@ -431,6 +447,43 @@ class App(Gtk.ApplicationWindow):
                 cr.save(); cr.set_source_rgb(1.0, 0.55, 0.1)
                 cr.move_to(x0 - s * 0.12, y0 + sh + s * 0.08); cr.line_to(x0 + sw + s * 0.12, y0 - s * 0.08); cr.stroke()
                 cr.restore()
+        elif what == "gear":           # settings: a cog (8 teeth around a ring, a hole in the middle)
+            ro, ri, n = s * 0.5, s * 0.36, 8
+            cr.new_path()
+            for i in range(n * 2):
+                a0 = (i / (n * 2)) * 2 * math.pi; a1 = ((i + 1) / (n * 2)) * 2 * math.pi
+                r = ro if i % 2 == 0 else ri
+                if i == 0: cr.move_to(cx + r * math.cos(a0), cy + r * math.sin(a0))
+                else: cr.line_to(cx + r * math.cos(a0), cy + r * math.sin(a0))
+                cr.line_to(cx + r * math.cos(a1), cy + r * math.sin(a1))
+            cr.close_path(); cr.stroke()
+            cr.new_path(); cr.arc(cx, cy, s * 0.14, 0, 2 * math.pi); cr.stroke()
+        elif what == "note":           # media controls: a music note (head + stem + flag)
+            q = s * 0.5
+            cr.new_path(); cr.arc(cx - q * 0.3, cy + q * 0.55, q * 0.28, 0, 2 * math.pi); cr.fill()
+            cr.move_to(cx - q * 0.02, cy + q * 0.55); cr.line_to(cx - q * 0.02, cy - q * 0.75)
+            cr.line_to(cx + q * 0.55, cy - q * 0.45); cr.stroke()
+        elif what in ("prev", "next", "playpause"):   # media: |<<  >||  >>|
+            q = s * 0.42; d = -1 if what == "prev" else 1
+            if what == "playpause":
+                cr.move_to(cx - q * 0.9, cy - q * 0.8); cr.line_to(cx - q * 0.1, cy); cr.line_to(cx - q * 0.9, cy + q * 0.8)
+                cr.close_path(); cr.fill()
+                cr.rectangle(cx + q * 0.25, cy - q * 0.8, q * 0.22, q * 1.6); cr.fill()
+                cr.rectangle(cx + q * 0.68, cy - q * 0.8, q * 0.22, q * 1.6); cr.fill()
+            else:
+                for off in (-0.55, 0.25):   # two triangles pointing the way, then a bar at the tip
+                    x0 = cx + d * off * q
+                    cr.move_to(x0 - d * q * 0.4, cy - q * 0.7); cr.line_to(x0 + d * q * 0.4, cy); cr.line_to(x0 - d * q * 0.4, cy + q * 0.7)
+                    cr.close_path(); cr.fill()
+                cr.rectangle(cx + d * q * 0.68 - q * 0.1, cy - q * 0.7, q * 0.2, q * 1.4); cr.fill()
+        elif what in ("vol-", "vol+"):  # volume: a speaker and - / +
+            q = s * 0.42
+            cr.move_to(cx - q, cy - q * 0.3); cr.line_to(cx - q * 0.55, cy - q * 0.3); cr.line_to(cx - q * 0.05, cy - q * 0.75)
+            cr.line_to(cx - q * 0.05, cy + q * 0.75); cr.line_to(cx - q * 0.55, cy + q * 0.3); cr.line_to(cx - q, cy + q * 0.3)
+            cr.close_path(); cr.fill()
+            cr.move_to(cx + q * 0.3, cy); cr.line_to(cx + q * 1.0, cy); cr.stroke()
+            if what == "vol+":
+                cr.move_to(cx + q * 0.65, cy - q * 0.35); cr.line_to(cx + q * 0.65, cy + q * 0.35); cr.stroke()
         elif what == "swap":           # keyboard <-> desktop screen (above / below in laptop posture): up + down arrows
             r = s * 0.5
             for xx, d in ((cx - r * 0.35, -1), (cx + r * 0.35, 1)):
@@ -761,8 +814,23 @@ class App(Gtk.ApplicationWindow):
                 # sure pannel"); it cancels itself after 6 s
                 self.confirm = True
                 GLib.timeout_add(6000, self.confirm_timeout)
+            elif code == "settings":
+                # closed -> open; open -> closed; media -> back to the settings panel
+                s = getattr(self, "settings", False)
+                self.settings = True if s == "media" else not s
+            elif code == "media":
+                self.settings = "media"
+            elif code.startswith("m-"):
+                # the player through MPRIS (playerctl: whichever player is active), the volume through PipeWire
+                cmd = {"m-prev": ["playerctl", "previous"], "m-play": ["playerctl", "play-pause"],
+                       "m-next": ["playerctl", "next"],
+                       "m-voldown": ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
+                       "m-volup": ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "5%+"]}[code]
+                try: subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError: pass
             elif code == "toggle":
                 self.mode = "pad" if self.mode == "keys" else "keys"
+                self.settings = False             # back from the gamepad = the normal bar (clicks + mic)
                 if self.mode == "keys" and getattr(self, "notouch", False):
                     self.set_notouch(False)       # back to typing = the touchpad screen works again
             elif code == "notouch":
