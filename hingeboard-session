@@ -1,0 +1,136 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Hingeboard's laptop session (labwc + LXQt on the desktop screen, the keyboard on the other one).
+#   hingeboard-session desktop|phone   (root; the session user runs it through doas) switch the graphical session
+#   hingeboard-session run             (the session user; tinydm starts it) start the laptop session
+#   hingeboard-session autostart       (labwc runs it at start) theme, desktop, then "layout apply"
+#   hingeboard-session layout [apply|swap|flip]   which screen is the keyboard (swap) and which way up (flip);
+#                                      remembered in ~/.config/hingeboard/layout
+#   hingeboard-session screens [apply|toggle|watch]   an external display: mirror (default) or TV only
+# screens A and B with their touchscreens, pinned in HB_* for every child: the keyboard runs with the per-layout
+# HINGEBOARD_OUTPUT/OTHER, and its buttons start this script again
+SCREEN_A=${HB_SCREEN_A:-${HINGEBOARD_OUTPUT:-DSI-1}}; SCREEN_B=${HB_SCREEN_B:-${HINGEBOARD_OTHER:-DSI-2}}
+TOUCH_A=${HB_TOUCH_A:-${HINGEBOARD_KB_TOUCH:-IPTSD Virtual Touchscreen 045E:0C02}}           # screen A's touchscreen
+TOUCH_B=${HB_TOUCH_B:-${HINGEBOARD_OTHER_TOUCH_NAME:-IPTSD Virtual Touchscreen 045E:0C01}}   # screen B's touchscreen
+export HB_SCREEN_A="$SCREEN_A" HB_SCREEN_B="$SCREEN_B" HB_TOUCH_A="$TOUCH_A" HB_TOUCH_B="$TOUCH_B"
+LAYOUT=$HOME/.config/hingeboard/layout; RUN=${XDG_RUNTIME_DIR:-/tmp}
+
+# the current layout -> KB (keyboard screen), KB_TOUCH, KB_ROT (how the keyboard draws), DESK (desktop screen),
+# DESK_TOUCH, DESK_T (its transform = the touchpad's rotation). Default "left 0": keyboard on screen A.
+# Swap only trades the screens' jobs - both panels sit the same way up, so the angles stay; flip turns both 180.
+layout() {
+	SIDE=; FLIP=; [ -f "$LAYOUT" ] && read -r SIDE FLIP < "$LAYOUT"; [ "$SIDE" = right ] || SIDE=left; [ "$FLIP" = 1 ] || FLIP=0
+	KB_ROT=90 DESK_T=270
+	if [ $SIDE = left ]; then KB=$SCREEN_A KB_TOUCH=$TOUCH_A DESK=$SCREEN_B DESK_TOUCH=$TOUCH_B
+	else KB=$SCREEN_B KB_TOUCH=$TOUCH_B DESK=$SCREEN_A DESK_TOUCH=$TOUCH_A; fi
+	[ $FLIP = 1 ] && KB_ROT=$(( (KB_ROT + 180) % 360 )) DESK_T=$(( (DESK_T + 180) % 360 ))
+	return 0
+}
+id_of() { echo "$1" | grep -o '[0-9A-Fa-f]\{4\}:[0-9A-Fa-f]\{4\}' | tail -1; }
+# labwc's config (Hingeboard's own dir, -C): the template from install.sh with the keyboard screen's touch mapping
+labwc_conf() {
+	mkdir -p $RUN/hingeboard-labwc
+	sed -e "s|@KB_TOUCH@|$KB_TOUCH|" -e "s|@KB_OUT@|$KB|" /usr/local/share/hingeboard/labwc/rc.xml > $RUN/hingeboard-labwc/rc.xml
+}
+
+case "$1" in
+desktop|phone)
+	[ "$1" = desktop ] && S=/usr/share/wayland-sessions/hingeboard-desktop.desktop || S=/usr/share/wayland-sessions/phosh.desktop
+	[ -f "$S" ] || { echo "missing $S"; exit 1; }
+	U=${DOAS_USER:-${SUDO_USER:-user}}	# the session user who asked (doas sets DOAS_USER)
+	# runs detached: the caller (an app in the old session) dies with it. tinydm restart LEAVES THE OLD SESSION
+	# RUNNING, so: set the session, stop tinydm, end every process of the session user, start tinydm once.
+	if [ "$2" != --now ]; then
+		setsid sh "$0" "$1" --now > /tmp/hingeboard-session.log 2>&1 < /dev/null &
+		exit 0
+	fi
+	echo "$(date) switching to $1 (user $U)"
+	tinydm-set-session -f -s "$S"
+	rc-service tinydm stop
+	sleep 1
+	pkill -u "$U" 2>/dev/null; sleep 2; pkill -9 -u "$U" 2>/dev/null; sleep 1
+	rc-service tinydm start
+	echo "$(date) done" ;;
+run)
+	# XDG_CURRENT_DESKTOP=LXQt:wlroots: lxqt-panel picks its window-list backend from it (with "LXQt:labwc" it found
+	# none); dbus-run-session: a session bus for gvfs (Trash, drives), udisks and LXQt; QT_QPA_PLATFORMTHEME=lxqt:
+	# real icons
+	export XDG_CURRENT_DESKTOP=LXQt:wlroots XDG_SESSION_DESKTOP=hingeboard-desktop HINGEBOARD_SESSION=desktop
+	export QT_QPA_PLATFORM=wayland QT_QPA_PLATFORMTHEME=lxqt QT_WAYLAND_DISABLE_WINDOWDECORATION=0
+	export XCURSOR_THEME=Adwaita XCURSOR_SIZE=32 GTK_THEME=Adwaita:dark
+	unset QT_QUICK_CONTROLS_MOBILE
+	layout; labwc_conf
+	exec dbus-run-session -- labwc -C $RUN/hingeboard-labwc -s "$0 autostart" ;;
+autostart)
+	# GTK apps draw their own title bar; phones set button-layout 'appmenu:' (no close button) - desktop buttons here
+	gsettings set org.gnome.desktop.wm.preferences button-layout 'appmenu:minimize,maximize,close' > /dev/null 2>&1
+	gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' > /dev/null 2>&1
+	gsettings set org.gnome.desktop.interface gtk-theme 'Adwaita-dark' > /dev/null 2>&1
+	[ -x /usr/libexec/pipewire-launcher ] && /usr/libexec/pipewire-launcher > /dev/null 2>&1 &
+	"$0" layout apply > /tmp/hingeboard-layout.log 2>&1
+	pcmanfm-qt --desktop --profile=lxqt > /dev/null 2>&1 &
+	lxqt-powermanagement > /dev/null 2>&1 &
+	"$0" screens watch > /tmp/hingeboard-screens.log 2>&1 & ;;
+layout)
+	layout
+	# a double tap must not undo the change: swap / flip only once per 3 s (the keyboard restarts in between, so a
+	# second tap can land on the new keyboard)
+	ST=$RUN/hingeboard-layout.stamp; NOW=$(date +%s)
+	case "$2" in swap|flip)
+		[ $(( NOW - $(cat "$ST" 2>/dev/null || echo 0) )) -lt 3 ] && { echo "$(date +%T) $2 ignored (double tap)"; exit 0; }
+		echo $NOW > "$ST" ;;
+	esac
+	case "$2" in
+	swap) [ $SIDE = left ] && SIDE=right || SIDE=left ;;
+	flip) FLIP=$((1 - FLIP)) ;;
+	esac
+	mkdir -p "$(dirname "$LAYOUT")"; echo "$SIDE $FLIP" > "$LAYOUT"; layout
+	echo "$(date +%T) layout: keyboard $KB (draws at $KB_ROT), desktop $DESK (transform $DESK_T)"
+	# stop the keyboard, touchpad and panel of the old layout
+	pkill -f "hingeboard-session touchpad-loop"; pkill -f "hingeboard-touchpad.py"; pkill -f 'bin/hingeboard$'
+	pkill -x lxqt-panel; sleep 0.5
+	# screens: the desktop screen turned to its side, the keyboard screen far away so the pointer cannot wander under
+	# the keyboard (wlroots clamps the pointer to the nearest output across the gap); then the external display
+	wlr-randr --output $DESK --on --transform $DESK_T --scale 2 --pos 0,0 --output $KB --on --transform normal --scale 3 --pos 4000,4000
+	"$0" screens apply
+	labwc_conf; kill -HUP ${LABWC_PID:-$(pidof labwc)} 2> /dev/null   # = labwc --reconfigure, also from outside the session
+	# the taskbar on the desktop screen
+	P=$HOME/.config/lxqt/panel.conf; [ -f $P ] && sed -i "s/^screen-name=.*/screen-name=$DESK/" $P
+	# the keyboard FIRST: pcmanfm-qt puts desktop icons on every screen until the keyboard covers its screen
+	HINGEBOARD_SESSION=desktop HINGEBOARD_OUTPUT=$KB HINGEBOARD_OTHER=$DESK HINGEBOARD_ROTATE=$KB_ROT HINGEBOARD_OTHER_TOUCH=$(id_of "$DESK_TOUCH") HINGEBOARD_RAW_TOUCH="$KB_TOUCH" \
+		setsid hingeboard > /tmp/hingeboard.log 2>&1 < /dev/null &
+	sleep 1
+	setsid lxqt-panel > /dev/null 2>&1 < /dev/null &
+	setsid "$0" touchpad-loop "$(id_of "$DESK_TOUCH")" $DESK_T > /dev/null 2>&1 < /dev/null & ;;
+touchpad-loop)
+	# the desktop screen's touch = the touchpad; restarted if it ever dies (a crash would leave no pointer)
+	D=${2#*:}
+	while :; do hingeboard-touchpad.py --device $D --rotate $3 --zoom labwc --gain 1.5 >> /tmp/hingeboard-touchpad.log 2>&1; sleep 1; done ;;
+screens)
+	# an external display (TV / monitor, e.g. through a USB-C dock): MIRROR (default) = it shows a full-screen copy
+	# of the desktop screen and sits out of the pointer's reach; TV = the desktop screen is switched off (its touch
+	# stays the touchpad) and the desktop and pointer live on the external display only. The keyboard's screens
+	# button runs "toggle"; "watch" applies the mode whenever a display comes or goes.
+	M=$RUN/hingeboard-screens
+	ext() { wlr-randr 2>/dev/null | sed -n 's/^\([A-Za-z0-9-]*\) ".*/\1/p' | grep -v -x -e "$SCREEN_A" -e "$SCREEN_B" | head -1; }
+	apply() {
+		layout; E=$(ext); mode=$(cat "$M" 2>/dev/null || echo mirror)
+		pkill -f "wl-mirror .*--fullscreen-output" 2>/dev/null
+		if [ -z "$E" ]; then
+			wlr-randr --output $DESK --on --transform $DESK_T --scale 2 --pos 0,0
+		elif [ "$mode" = tv ]; then
+			wlr-randr --output $E --on --pos 0,0 && wlr-randr --output $DESK --off
+		else
+			wlr-randr --output $DESK --on --transform $DESK_T --scale 2 --pos 0,0 --output $E --on --pos 8000,0
+			setsid wl-mirror --fullscreen-output $E $DESK > /dev/null 2>&1 < /dev/null &
+		fi
+		echo "$(date +%T) external=${E:-none} mode=$mode desktop=$DESK"
+	}
+	case "$2" in
+	toggle) [ "$(cat "$M" 2>/dev/null)" = tv ] && echo mirror > "$M" || echo tv > "$M"; apply ;;
+	watch) last=; while :; do e=$(ext); [ "$e" != "$last" ] && { last=$e; apply; }; sleep 2; done ;;
+	*) apply ;;
+	esac ;;
+*)
+	echo "usage: hingeboard-session desktop|phone|run|autostart|layout [apply|swap|flip]|screens [apply|toggle|watch]"; exit 1 ;;
+esac

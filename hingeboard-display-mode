@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Surface Duo display modes for the keyboard app (request 2026-11-06: "when the keyboard is on the main screen should
+# be the other screen and all the app icons should appear there like normal", "there should only be one display when
+# the keyboard is on", "the one display should force orientation to be locked in landscape").
+#   keyboard : DSI-2 (right) = Phosh's PRIMARY display (top bar, home, app grid, lock screen), rotated to landscape
+#              (transform HINGEBOARD_DISPLAY_TRANSFORM, default 3 = 270) to match the keyboard's laptop posture; DSI-1 stays on
+#              only as the keyboard's surface.
+#   phone    : back to normal: DSI-1 primary, both portrait.
+# Uses phosh's org.gnome.Mutter.DisplayConfig (what GNOME Settings > Displays calls); method 2 (persistent) because
+# phosh ignored the primary flag with method 1 (temporary) - so 'phone' MUST run on exit (the keyboard app does).
+# usage (session user, inside the session): hingeboard-display-mode keyboard|phone
+mode=${1:-keyboard}
+T=${HINGEBOARD_DISPLAY_TRANSFORM:-3}   # 3 = 270; 1 (90) was upside down in laptop posture (2026-11-06)
+call() { gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+         --method org.gnome.Mutter.DisplayConfig.$1 "$@"; }
+serial=$(gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+         --method org.gnome.Mutter.DisplayConfig.GetCurrentState | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p')
+[ -n "$serial" ] || { echo "no DisplayConfig (is phosh running?)"; exit 1; }
+# phosh 0.47 SEGFAULTS when its current primary display changes rotation (2026-11-06: wlr-randr rotate of the primary
+# DSI-2 and a one-step "primary back + un-rotate" both killed the session; "primary to DSI-2 + rotate" in one step from
+# phone mode worked). So: entering = one step; leaving = (1) primary back to DSI-1, rotation unchanged, (2) un-rotate
+# the now non-primary DSI-2.
+apply() {
+  s=$(gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+      --method org.gnome.Mutter.DisplayConfig.GetCurrentState | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p')
+  gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig "$s" 2 "$1" "@a{sv} {}" >/dev/null
+}
+cur_t=$(gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.GetCurrentState | grep -oE "\(450, 0, 3.0, (uint32 )?[0-9]" | grep -oE "[0-9]$")
+case "$mode" in
+  keyboard)
+    apply "[(0, 0, 3.0, 0, false, [('DSI-1', '1350x1800@60', @a{sv} {})]), (450, 0, 3.0, $T, true, [('DSI-2', '1350x1800@60', @a{sv} {})])]" ;;
+  phone)
+    apply "[(0, 0, 3.0, 0, true, [('DSI-1', '1350x1800@60', @a{sv} {})]), (450, 0, 3.0, ${cur_t:-0}, false, [('DSI-2', '1350x1800@60', @a{sv} {})])]"
+    sleep 2
+    apply "[(0, 0, 3.0, 0, true, [('DSI-1', '1350x1800@60', @a{sv} {})]), (450, 0, 3.0, 0, false, [('DSI-2', '1350x1800@60', @a{sv} {})])]" ;;
+  *) echo "usage: $0 keyboard|phone"; exit 1 ;;
+esac && echo "display mode: $mode"

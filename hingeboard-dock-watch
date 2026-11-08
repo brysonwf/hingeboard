@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Dock plugged in -> Hingeboard's laptop session. Runs as the session user inside Phosh (autostart
+# hingeboard-dock-watch.desktop) and follows the display connectors a USB-C dock drives (DisplayPort alt mode, HDMI)
+# through udev DRM events. Only a PLUG-IN EDGE switches: a dock already connected when Phosh starts (e.g. after Exit
+# from the laptop session) is left alone. In the laptop session the display itself is handled by
+# "hingeboard-session screens" (mirror / TV only). HINGEBOARD_DOCK_DRYRUN=1 only logs.
+# Log: $XDG_RUNTIME_DIR/hingeboard-dock-watch.log
+L=${XDG_RUNTIME_DIR:-/tmp}/hingeboard-dock-watch.log
+log() { echo "$(date +%T) $*" >> "$L"; }
+state() {
+	for s in /sys/class/drm/card*-DP-*/status /sys/class/drm/card*-HDMI-*/status; do
+		[ "$(cat "$s" 2>/dev/null)" = connected ] && { echo docked; return; }
+	done
+	echo undocked
+}
+last=$(state); log "start: $last"
+udevadm monitor --udev --subsystem-match=drm 2>/dev/null | while read -r line; do
+	case "$line" in *change*|*add*|*remove*) ;; *) continue ;; esac
+	sleep 1                                 # let the connector settle (DP link training, EDID read)
+	now=$(state)
+	[ "$now" = "$last" ] && continue
+	log "edge: $last -> $now"; last=$now
+	if [ "$now" = docked ]; then
+		log "docked -> laptop session"
+		[ "${HINGEBOARD_DOCK_DRYRUN:-0}" = 1 ] || doas /usr/local/bin/hingeboard-session desktop
+	fi
+done

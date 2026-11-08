@@ -1,0 +1,839 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Hingeboard (2026-11-06, LOOP.md G3; request: "make an app for my permanent keyboard on one screen -- that
+keyboard app should change the orientation and function of the other screen", "the keyboard app needs to take over the
+screen instead of pmos gui ... until the user exited it", "maybe the controller is a button on the on screen keyboard",
+"so i can swap between if i am playing a game on the hdmi output").
+A GTK4 layer-shell OVERLAY covering one whole screen (default DSI-1 = the screen without the camera), with NO keyboard
+focus (keys go to the app on the other screen / HDMI), drawn for LAPTOP posture (rotated 90: hinge at the top).
+Top bar: [mouse symbol = right click] [gamepad or keyboard symbol = one switch, shows the mode a tap goes to] [Phone/Exit].
+  Keys     standard laptop layout -> a uinput keyboard (latching Shift/Ctrl/Alt/Super, Caps, hold = repeat)
+  Gamepad  D-pad, A B X Y, L R, Select Start -> a uinput gamepad, multi-touch (hold several at once)
+  Exit     closes the keyboard and puts both screens back to phone mode
+While it runs there is ONE display: the other screen is Phosh's primary display (bars, home, app grid, apps) in
+landscape (hingeboard-display-mode keyboard); this screen is only the keyboard. Exit (or SIGTERM) restores phone mode.
+Run as the session user: hingeboard (it preloads gtk4-layer-shell itself).
+Needs py3-gobject3, py3-cairo, py3-evdev, gtk4-layer-shell, wlr-randr; /dev/uinput writable by the input group."""
+import glob, math, os, re, signal, subprocess, sys, time
+# gtk4-layer-shell must be loaded before libwayland-client: run again with it preloaded
+_LS = "/usr/lib/libgtk4-layer-shell.so.0"
+if os.path.exists(_LS) and _LS not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (_LS + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+import gi
+gi.require_version("Gtk", "4.0"); gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gtk, Gdk, GLib, Gtk4LayerShell as LS
+import evdev
+from evdev import ecodes as E, UInput
+
+OUT = os.environ.get("HINGEBOARD_OUTPUT", "DSI-1")             # the keyboard screen
+OTHER = os.environ.get("HINGEBOARD_OTHER", "DSI-2")            # the screen the mode switch acts on
+OTHER_TOUCH = os.environ.get("HINGEBOARD_OTHER_TOUCH", "045E:0C01")
+DEBUG = bool(os.environ.get("HINGEBOARD_DEBUG"))                 # print every touch/press + its hit test
+# an empty, dead strip along the top (hinge) edge, ~ one finger wide (request 2026-11-06: "padd the top of the keyboard
+# area by a finger width to reduce accidental touches on the other screen"); fraction of the keyboard height
+TOP_PAD = float(os.environ.get("HINGEBOARD_TOP_PAD", "0.14"))   # 0.10 -> 0.14: "squeeze the keyboard a bit more from the top"
+KB_WINDOWS = bool(os.environ.get("HINGEBOARD_WINDOWS"))   # the open-windows row on the keyboard (off by default)
+GAP = float(os.environ.get("HINGEBOARD_GAP", "3.5"))   # black space around each key, logical px per side (2 too tight,
+                                                   # 5 too much - 2026-11-06)
+ROT = int(os.environ.get("HINGEBOARD_ROTATE", "90"))           # 0 = portrait, 90 = laptop posture (hinge at the top)
+
+K = E
+KEYS = [  # (label, keycode, width units); None keycode = spacer
+    [("Esc", K.KEY_ESC, 1), ("1", K.KEY_1, 1), ("2", K.KEY_2, 1), ("3", K.KEY_3, 1), ("4", K.KEY_4, 1), ("5", K.KEY_5, 1),
+     ("6", K.KEY_6, 1), ("7", K.KEY_7, 1), ("8", K.KEY_8, 1), ("9", K.KEY_9, 1), ("0", K.KEY_0, 1), ("-", K.KEY_MINUS, 1),
+     ("=", K.KEY_EQUAL, 1), ("Bksp", K.KEY_BACKSPACE, 1.6)],
+    [("Tab", K.KEY_TAB, 1.4), ("q", K.KEY_Q, 1), ("w", K.KEY_W, 1), ("e", K.KEY_E, 1), ("r", K.KEY_R, 1), ("t", K.KEY_T, 1),
+     ("y", K.KEY_Y, 1), ("u", K.KEY_U, 1), ("i", K.KEY_I, 1), ("o", K.KEY_O, 1), ("p", K.KEY_P, 1), ("[", K.KEY_LEFTBRACE, 1),
+     ("]", K.KEY_RIGHTBRACE, 1), ("\\", K.KEY_BACKSLASH, 1.2)],
+    [("Caps", K.KEY_CAPSLOCK, 1.7), ("a", K.KEY_A, 1), ("s", K.KEY_S, 1), ("d", K.KEY_D, 1), ("f", K.KEY_F, 1), ("g", K.KEY_G, 1),
+     ("h", K.KEY_H, 1), ("j", K.KEY_J, 1), ("k", K.KEY_K, 1), ("l", K.KEY_L, 1), (";", K.KEY_SEMICOLON, 1),
+     ("'", K.KEY_APOSTROPHE, 1), ("Enter", K.KEY_ENTER, 1.9)],
+    [("Shift", K.KEY_LEFTSHIFT, 2.2), ("z", K.KEY_Z, 1), ("x", K.KEY_X, 1), ("c", K.KEY_C, 1), ("v", K.KEY_V, 1), ("b", K.KEY_B, 1),
+     ("n", K.KEY_N, 1), ("m", K.KEY_M, 1), (",", K.KEY_COMMA, 1), (".", K.KEY_DOT, 1), ("/", K.KEY_SLASH, 1),
+     ("Shift", K.KEY_RIGHTSHIFT, 2.4)],
+    [("Ctrl", K.KEY_LEFTCTRL, 1.4), ("Super", K.KEY_LEFTMETA, 1.3), ("Alt", K.KEY_LEFTALT, 1.3), ("", K.KEY_SPACE, 5.4),
+     ("Alt", K.KEY_RIGHTALT, 1.2), ("<", K.KEY_LEFT, 1), ("^", K.KEY_UP, 1), ("v", K.KEY_DOWN, 1), (">", K.KEY_RIGHT, 1)],
+]
+LETTERS = {getattr(K, "KEY_" + c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}      # drawn bright; other keys dimmer
+SHIFTED = dict(zip("1234567890-=[]\\;',./`", "!@#$%^&*()_+{}|:\"<>?~"))
+MODS = {K.KEY_LEFTSHIFT, K.KEY_RIGHTSHIFT, K.KEY_LEFTCTRL, K.KEY_LEFTMETA, K.KEY_LEFTALT, K.KEY_RIGHTALT}
+# Gamepad v2 (request 2026-11-06: "make a better gamepad with a dpad and a thumbstick"), Xbox-style:
+# (kind, code, label, cx, cy, size) - cx as a fraction of the width, cy of the height below the bar, size (a radius /
+# half-width) as a fraction of min(width, height below the bar).
+#   pad   : a round button          rect : a rounded-rectangle icon button (Select / Start, in the top row)
+# The D-pad and X Y A B are not in this table: layout() makes them FINGERTIP-SIZED CIRCLES (FINGER_MM across, from the
+# screen's real size) - four direction circles on the left (two at once = a diagonal; arrow keys + hat) and the four
+# face buttons mirrored on the right, same size and placement, so every hit zone is obvious. The two THUMBSTICKS float: a touch in the left / right half below the
+# clusters makes the left / right stick appear, centred where the thumb landed; it disappears when the thumb lifts.
+DPAD_AT = (0.20, 0.36)                 # the D-pad's centre (fractions of width / pad-area height); X Y A B mirror it
+FINGER_MM = 11.0                       # a direction / face button's diameter in millimetres
+PAD = [
+    ("pad", K.BTN_TL, "L", 0.05, 0.08, 0.055), ("pad", K.BTN_TR, "R", 0.95, 0.08, 0.055),
+]
+STICK_R = 0.17                         # a thumbstick's travel radius, a fraction of the pad area's height
+STICK_AXES = {"ls": (K.ABS_X, K.ABS_Y), "rs": (K.ABS_RX, K.ABS_RY)}
+PAD_COLORS = {K.BTN_SOUTH: (0.30, 0.68, 0.30), K.BTN_EAST: (0.82, 0.26, 0.24),     # A green, B red,
+              K.BTN_WEST: (0.22, 0.48, 0.86), K.BTN_NORTH: (0.90, 0.72, 0.15)}     # X blue, Y yellow
+# 2026-11-06: right click top LEFT (a mouse symbol, right button orange), a gamepad/keyboard SYMBOL in the
+# centre (one switch), Phone/Exit on the right
+BAR = [("", "lclick"), ("", "rclick"), ("", "mic"), ("", "toggle"), ("Exit", "exit")]   # Enter: the key on the keyboard
+# enter beside the mic: say it, then send it (2026-11-06)
+# left + right mouse buttons (held while the finger is down: hold left + drag on the trackpad = select / move),
+# mic = voice to text (moved up from the bottom row), mode switch, phone (2026-11-06)   # one Keys<->Gamepad switch (2026-11-06); Desktop dropped 2026-11-06 (its live
+                                                                    # rotation crashed phosh) -> one-display mode instead
+ACTIVE_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hingeboard-active")
+SCREENS_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hingeboard-screens")   # mirror | tv
+NOTOUCH_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hingeboard-notouch")   # 1 = touchpad off
+IN_DESKTOP = os.environ.get("HINGEBOARD_SESSION") == "desktop"   # running inside the labwc desktop session (laptop mode)
+
+def rrect(cr, x0, y0, w, h, r):
+    """a rounded-rectangle path"""
+    cr.new_sub_path()
+    cr.arc(x0 + w - r, y0 + r, r, -math.pi / 2, 0); cr.arc(x0 + w - r, y0 + h - r, r, 0, math.pi / 2)
+    cr.arc(x0 + r, y0 + h - r, r, math.pi / 2, math.pi); cr.arc(x0 + r, y0 + r, r, math.pi, 1.5 * math.pi)
+    cr.close_path()
+
+kbd = UInput({E.EV_KEY: [c for row in KEYS for (_, c, _) in row if isinstance(c, int)]}, name="Hingeboard")
+# dictated text -> key presses (Vosk gives lower-case words; digits/punctuation as they come)
+CHARKEY = {**{ch: getattr(K, "KEY_" + ch.upper()) for ch in "abcdefghijklmnopqrstuvwxyz0123456789"},
+           " ": K.KEY_SPACE, "'": K.KEY_APOSTROPHE, "-": K.KEY_MINUS, ".": K.KEY_DOT, ",": K.KEY_COMMA}
+# a mouse for the Right click bar button (clicks at wherever the trackpad put the pointer); REL axes make libinput
+# treat it as a pointer device
+mouse = UInput({E.EV_KEY: [K.BTN_LEFT, K.BTN_RIGHT], E.EV_REL: [K.REL_X, K.REL_Y]}, name="Hingeboard mouse")
+# The D-pad is the ARROW KEYS by default; its hat (ABS_HAT0X/Y) only with HINGEBOARD_PAD_HAT=1 - GZDoom mis-read the hat
+# (left/right acted as up/down) even with the arrows added, so by default the pad does not have a hat at all.
+PAD_HAT = bool(os.environ.get("HINGEBOARD_PAD_HAT"))
+_pad_abs = [(a, evdev.AbsInfo(0, -32768, 32767, 16, 128, 0)) for a in (K.ABS_X, K.ABS_Y, K.ABS_RX, K.ABS_RY)]
+if PAD_HAT:
+    _pad_abs += [(K.ABS_HAT0X, evdev.AbsInfo(0, -1, 1, 0, 0, 0)), (K.ABS_HAT0Y, evdev.AbsInfo(0, -1, 1, 0, 0, 0))]
+pad = UInput({E.EV_KEY: [K.BTN_SOUTH, K.BTN_EAST, K.BTN_NORTH, K.BTN_WEST, K.BTN_TL, K.BTN_TR, K.BTN_SELECT, K.BTN_START],
+              E.EV_ABS: _pad_abs},
+             name="Hingeboard gamepad", vendor=0x045e, product=0x028e)   # Xbox-360-style IDs: games map it
+
+
+class App(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Hingeboard")
+        self.mode, self.desktop, self.latched, self.caps = os.environ.get("HINGEBOARD_MODE", "keys"), False, set(), False
+        self.touch = {}                    # sequence -> pressed item
+        self.stick = (0.0, 0.0)            # thumbstick deflection, -1..1 each (drawn as the knob position)
+        self.sticks = {}                   # floating sticks: code -> deflection
+        self.dpad = (0, 0)                 # D-pad hat x, y (-1, 0, 1)
+        self.tp = None                     # the touchpad process (desktop mode)
+        self.area = Gtk.DrawingArea(hexpand=True, vexpand=True); self.area.set_draw_func(self.draw)
+        ev = Gtk.EventControllerLegacy(); ev.connect("event", self.on_event); self.area.add_controller(ev)
+        self.set_child(self.area)
+        self.ext = False                   # an external display (TV / monitor) is connected: the screens button shows
+        if IN_DESKTOP:
+            GLib.timeout_add(2000, self.poll_ext)
+
+    # ---- external display in the laptop session: the screens button switches between MIRROR (the TV copies the
+    # desktop screen; default) and TV ONLY (the desktop screen is off and only a touchpad, the pointer lives on the
+    # TV) through hingeboard-session screens toggle; the session's watcher applies the mode on plug-in.
+    def poll_ext(self):
+        ext = False
+        for f in glob.glob("/sys/class/drm/card*-*/status"):
+            name = os.path.basename(os.path.dirname(f)).split("-", 1)[-1]
+            try:
+                ext = ext or (not name.startswith("DSI") and open(f).read().strip() == "connected")
+            except OSError:
+                pass
+        if ext != self.ext:
+            self.ext = ext; self.area.queue_draw()
+        return True
+    def mm(self, v):
+        """millimetres -> layout pixels on the keyboard's screen (its physical size from the compositor)"""
+        mons = Gdk.Display.get_default().get_monitors()
+        for i in range(mons.get_n_items()):
+            m = mons.get_item(i)
+            if m.get_connector() == OUT and m.get_width_mm() > 0:
+                g = m.get_geometry(); return v * max(g.width, g.height) / max(m.get_width_mm(), m.get_height_mm())
+        return v * 5.3                     # the Surface Duo at scale 3
+
+    def set_notouch(self, off):
+        """switch the touchpad screen's touch off (e.g. while holding the phone to play) or back on"""
+        self.notouch = off
+        try:
+            open(NOTOUCH_FILE, "w").write("1" if off else "0")
+        except OSError:
+            pass
+        subprocess.run(["pkill", "-USR1", "-f", "hingeboard-touchpad.py"], capture_output=True)
+        self.area.queue_draw()
+    def screens_mode(self):
+        try:
+            return open(SCREENS_FILE).read().strip()
+        except OSError:
+            return "mirror"
+
+    # ---- geometry: everything is laid out in the ROTATED (laptop) frame, w x h
+    def frame(self):
+        W, H = self.area.get_width(), self.area.get_height()
+        return (H, W) if ROT in (90, 270) else (W, H)
+    def to_frame(self, px, py):
+        W, H = self.area.get_width(), self.area.get_height()
+        return {0: (px, py), 90: (py, W - px), 270: (H - py, px), 180: (W - px, H - py)}[ROT]
+    def items(self):
+        w, h0 = self.frame(); top = h0 * (TOP_PAD if self.mode == "keys" else 0.03)
+        if getattr(self, "confirm", False):      # "are you sure" panel: only its two buttons are live
+            bw, bh = w * 0.34, h0 * 0.24; y = top + (h0 - top) * 0.52
+            return [("confirm", "yes", "Switch", w * 0.12, y, bw, bh),
+                    ("confirm", "no", "Cancel", w * 0.54, y, bw, bh)]
+        out = self.layout(w, h0 - top)
+        # dead strip along the hinge edge: everything moves down by 'top'; touches there hit nothing. The keyboard's
+        # icon row reaches halfway into it (request: "scooch up the special buttons")
+        return [it[:4] + (it[4] + (top * 0.5 if it[0] == "bar" and self.mode == "keys" else top),) + it[5:]
+                for it in out]
+
+    def layout(self, w, h):
+        bar0 = h * 0.11 if self.mode == "keys" else 0; out = []   # the gamepad has no top bar
+        # a row of the open windows under the icons (request 2026-11-06: "add a line of all the open windows"); tap = focus
+        # window row: OFF (request 2026-11-06: "we don't want the windows listed on the keyboard side" - the taskbar on
+        # the desktop screen lists them); HINGEBOARD_WINDOWS=1 brings it back
+        wins = getattr(self, "windows", []) if KB_WINDOWS else []
+        wr = h * 0.085 if wins else 0  # the row takes space only when there are windows ("remove the added space above
+        wy = bar0 + h * 0.015          # the number row")
+        if wins:
+            ww = min(w / len(wins), w / 3)
+            for i, (title, app) in enumerate(wins):
+                out.append(("win", i, title or app, i * ww + GAP, wy, ww - 2 * GAP, wr))
+        bar = bar0 + wr + h * (0.025 if wins else 0.02)   # small gap under the bar / window row
+        # laptop session: swap (keyboard <-> desktop screen), flip (both upside down), screens (only with a TV)
+        extra = ([("", "swap"), ("", "flip")] if IN_DESKTOP else []) + ([("", "screens")] if getattr(self, "ext", False) else [])
+        bar_items = BAR[:-1] + extra + BAR[-1:] if self.mode == "keys" else []
+        bw = w / max(1, len(bar_items))
+        for i, (lab, act) in enumerate(bar_items):
+            if act == "toggle": lab = ""          # drawn as a symbol (draw_icon): the mode a tap goes TO
+            if act == "exit": lab = ""            # a phone symbol: back to the Phosh phone GUI (2026-11-06)
+            out.append(("bar", act, lab, i * bw + 3, 3, bw - 6, bar0 - 6))
+        if self.mode == "keys":
+            rh = (h - bar) / len(KEYS)
+            for r, row in enumerate(KEYS):
+                units = sum(u for (_, _, u) in row); kw = w / units; x = 0
+                for (lab, code, u) in row:
+                    out.append(("key", code, lab, x + GAP, bar + r * rh + GAP, kw * u - 2 * GAP, rh - 2 * GAP)); x += kw * u
+        else:
+            base = min(w, h - bar)
+            for (kind, code, lab, fx, fy, fs) in PAD:
+                r = fs * base; cx, cy = fx * w, bar + fy * (h - bar)
+                if kind == "rect":
+                    out.append((kind, code, lab, cx - 1.7 * r, cy - 0.7 * r, 3.4 * r, 1.4 * r))
+                else:
+                    out.append((kind, code, lab, cx - r, cy - r, 2 * r, 2 * r))
+            # the D-pad (left) and X Y A B (right): fingertip circles, a small gap apart, mirrored
+            rb = self.mm(FINGER_MM) / 2; arm = 2 * rb * 1.12; sz = arm + rb   # a small gap between neighbours
+            dcx, fcx, fcy = DPAD_AT[0] * w, (1 - DPAD_AT[0]) * w, bar + DPAD_AT[1] * (h - bar)
+            for (hx, hy), lab in (((0, -1), "\u25b2"), ((0, 1), "\u25bc"), ((-1, 0), "\u25c0"), ((1, 0), "\u25b6")):
+                out.append(("dir", (hx, hy), lab, dcx + hx * arm - rb, fcy + hy * arm - rb, 2 * rb, 2 * rb))
+            for code, lab, ox, oy in ((K.BTN_NORTH, "Y", 0, -1), (K.BTN_SOUTH, "A", 0, 1),
+                                      (K.BTN_WEST, "X", -1, 0), (K.BTN_EAST, "B", 1, 0)):
+                out.append(("pad", code, lab, fcx + ox * arm - rb, fcy + oy * arm - rb, 2 * rb, 2 * rb))
+            # the invisible thumbsticks: the left / right half below the clusters (last = buttons win in hit())
+            zy = fcy + sz + 0.03 * (h - bar)
+            # keyboard (back to typing) "&", Select "-", Start "+": one column in the middle (as far from the D-pad,
+            # X Y A B and L / R as it can be), starting at the top
+            col = (("bar", "toggle", "&"), ("rect", K.BTN_SELECT, "\u2212"), ("rect", K.BTN_START, "+"))
+            bs = self.mm(FINGER_MM) * 0.7; step = bs * 1.45
+            for i, (kind, code, lab) in enumerate(col):
+                yc = bar + 0.02 * (h - bar) + bs / 2 + i * step
+                out.insert(i, (kind, code, lab, w / 2 - bs / 2, yc - bs / 2, bs, bs))
+            out.append(("stickzone", "ls", "", 0, zy, w / 2, h - zy))
+            out.append(("stickzone", "rs", "", w / 2, zy, w / 2, h - zy))
+        return out
+    def hit(self, fx, fy):
+        for it in self.items():
+            _, _, _, x, y, iw, ih = it
+            if x <= fx <= x + iw and y <= fy <= y + ih:
+                return it
+        return None
+
+    # ---- drawing
+    def draw(self, area, cr, W, H):
+        cr.set_source_rgb(0, 0, 0); cr.paint()      # TRUE black: the AMOLED pixels are off (top strip + gaps)
+        cr.save()
+        if ROT == 90: cr.translate(W, 0); cr.rotate(math.pi / 2)
+        elif ROT == 270: cr.translate(0, H); cr.rotate(-math.pi / 2)
+        elif ROT == 180: cr.translate(W, H); cr.rotate(math.pi)
+        pressed = {id(v) for v in self.touch.values()}
+        if getattr(self, "confirm", False):       # the "are you sure" panel
+            w, h0 = self.frame(); top = h0 * (TOP_PAD if self.mode == "keys" else 0.03)
+            cr.set_source_rgb(0.92, 0.93, 0.95); cr.select_font_face("Sans"); cr.set_font_size(min(26, h0 * 0.07))
+            msg = "Switch to phone mode?"; ext = cr.text_extents(msg)
+            cr.move_to((w - ext.width) / 2 - ext.x_bearing, top + (h0 - top) * 0.30); cr.show_text(msg)
+            for it in self.items():
+                _, code, lab, x, y, iw, ih = it
+                down = any(v[:3] == it[:3] for v in self.touch.values())
+                rrect(cr, x, y, iw, ih, 12)
+                if down: cr.set_source_rgb(0.25, 0.55, 0.95); cr.fill_preserve()
+                cr.set_source_rgb(*((0.95, 0.55, 0.10) if code == "yes" else (0.55, 0.57, 0.65)))
+                cr.set_line_width(2); cr.stroke()
+                cr.set_source_rgb(0.92, 0.93, 0.95); cr.set_font_size(min(24, ih * 0.35))
+                ext = cr.text_extents(lab)
+                cr.move_to(x + (iw - ext.width) / 2 - ext.x_bearing, y + (ih - ext.height) / 2 - ext.y_bearing); cr.show_text(lab)
+            cr.restore(); return
+        for it in self.items():
+            kind, code, lab, x, y, iw, ih = it
+            down = any(v[:3] == it[:3] for v in self.touch.values())
+            if kind == "stickzone":                      # drawn only while a thumb holds it, centred under the thumb
+                if code == "ls":                         # a small dashed line in the middle: where the halves meet
+                    cr.save(); cr.set_source_rgb(0.30, 0.31, 0.36); cr.set_line_width(1.5); cr.set_dash([6, 8])
+                    cr.move_to(x + iw, y + ih * 0.15); cr.line_to(x + iw, y + ih * 0.85); cr.stroke(); cr.restore()
+                o = (getattr(self, "stick_origin", None) or {}).get(code)
+                if o: self.draw_stick(cr, o[0] - o[2], o[1] - o[2], 2 * o[2], True, self.sticks.get(code, (0.0, 0.0)))
+                continue
+            if kind == "dpad": self.draw_dpad(cr, x, y, iw); continue
+            on = (kind == "key" and (code in self.latched or (code == K.KEY_CAPSLOCK and self.caps))) or \
+                 (kind == "bar" and code == "toggle")
+            # OUTLINE keys on a black background (request 2026-11-06: "can we make the keys only outlines so the bg is
+            # also black?" - AMOLED: the inside stays off). Filled only while pressed / while the mic is active.
+            # non-letter keys slightly dimmer than a-z (request 2026-11-06: "slightly dim the non-letter keys")
+            dim = (kind == "key" and code != "mic" and code not in LETTERS) or kind == "win"   # by key code: down arrow is "v"
+            edge = (0.26, 0.27, 0.31) if dim else (0.38, 0.40, 0.46); fill = None
+            if on: edge = (0.25, 0.55, 0.95)
+            if kind == "pad" and code in PAD_COLORS: edge = PAD_COLORS[code]
+            if down: fill = PAD_COLORS.get(code, (0.25, 0.55, 0.95)) if kind == "pad" else (0.25, 0.55, 0.95)
+            if lab in ("&", "\u2212", "+") and self.mode != "keys":   # the gamepad's sign buttons: just the sign
+                if down:
+                    rrect(cr, x, y, iw, ih, 8); cr.set_source_rgb(0.16, 0.17, 0.20); cr.fill()
+                cr.set_source_rgb(0.92, 0.93, 0.95); cr.select_font_face("Sans", 0, 1); cr.set_font_size(ih * 0.5)
+                ext = cr.text_extents(lab)
+                cr.move_to(x + (iw - ext.width) / 2 - ext.x_bearing, y + (ih - ext.height) / 2 - ext.y_bearing)
+                cr.show_text(lab); continue
+            if kind == "bar":                            # the top bar: icons only, no outline; a soft grey while pressed
+                st = getattr(self, "dict_state", None) if code == "mic" else None
+                if down or st:                           # mic: orange = loading the model, red = listening
+                    rrect(cr, x, y, iw, ih, 8)
+                    cr.set_source_rgb(*((0.85, 0.20, 0.18) if st == "listening" else (0.95, 0.55, 0.10) if st
+                                        else (0.16, 0.17, 0.20))); cr.fill()
+                self.draw_icon(cr, x, y, iw, ih, {"lclick": "mouse-l", "rclick": "mouse", "exit": "phone", "mic": "mic",
+                                                  "enter": "enter", "swap": "swap", "flip": "flip",
+                                                  "notouch": "lock" if getattr(self, "notouch", False) else "unlock",
+                                                  "screens": "screens-tv" if self.screens_mode() == "tv" else "screens"}.get(
+                    code, "pad" if self.mode == "keys" else "keys"))
+                continue
+            if kind == "rect":                           # Select / Start: icons only, like the rest of the top row
+                if down:
+                    rrect(cr, x, y, iw, ih, 8); cr.set_source_rgb(0.16, 0.17, 0.20); cr.fill()
+                self.draw_icon(cr, x, y, iw, ih, "select" if code == K.BTN_SELECT else "start"); continue
+            mic = kind == "key" and code == "mic"
+            if mic:                                      # orange = loading the model, red = listening
+                st = getattr(self, "dict_state", None)
+                fill = (0.85, 0.20, 0.18) if st == "listening" else (0.95, 0.55, 0.10) if st == "loading" else fill
+            def shape():
+                if kind in ("pad", "dir"): cr.new_path(); cr.arc(x + iw / 2, y + ih / 2, iw / 2 - 1, 0, 2 * math.pi)
+                else: rrect(cr, x + 0.75, y + 0.75, iw - 1.5, ih - 1.5, min(8, iw / 4, ih / 4))
+            if fill:
+                shape(); cr.set_source_rgb(*fill); cr.fill()
+            shape(); cr.set_source_rgb(*edge); cr.set_line_width(1.5); cr.stroke()
+            if mic:
+                self.draw_icon(cr, x, y, iw, ih, "mic"); continue
+            if kind == "bar" and code in ("toggle", "rclick"):
+                self.draw_icon(cr, x, y, iw, ih, "mouse" if code == "rclick" else "pad" if self.mode == "keys" else "keys")
+                continue
+            text = lab
+            if kind == "key" and len(lab) == 1:
+                up = self.caps != bool(self.latched & {K.KEY_LEFTSHIFT, K.KEY_RIGHTSHIFT})
+                text = (lab.upper() if lab.isalpha() and up else SHIFTED.get(lab, lab) if self.latched & {K.KEY_LEFTSHIFT, K.KEY_RIGHTSHIFT} else lab)
+            lc = PAD_COLORS[code] if (kind == "pad" and code in PAD_COLORS and not down) else \
+                 (0.62, 0.63, 0.66) if (dim and not down and not on) else (0.92, 0.93, 0.95)
+            cr.set_source_rgb(*lc); cr.select_font_face("Sans")
+            cr.set_font_size(min(ih * 0.42, 22 if len(text) <= 2 else 15))
+            if kind == "win":                            # window row: shorten the title to fit its button
+                cr.set_font_size(min(ih * 0.40, 13))
+                while text and cr.text_extents(text + "…").width > iw - 12: text = text[:-1]
+                if text != lab: text = text + "…"
+            ext = cr.text_extents(text)
+            cr.move_to(x + (iw - ext.width) / 2 - ext.x_bearing, y + (ih - ext.height) / 2 - ext.y_bearing); cr.show_text(text)
+        cr.restore()
+
+    def draw_stick(self, cr, x, y, d, active, defl=None):
+        """thumbstick: a recessed base ring + a knob that follows the deflection"""
+        R = d / 2; cx, cy = x + R, y + R      # outlines on black (AMOLED); the knob fills only while held
+        cr.set_line_width(1.5)
+        cr.new_path(); cr.set_source_rgb(0.38, 0.40, 0.46); cr.arc(cx, cy, R - 1, 0, 2 * math.pi); cr.stroke()
+        cr.new_path(); cr.set_source_rgb(0.22, 0.23, 0.28); cr.arc(cx, cy, R * 0.55, 0, 2 * math.pi); cr.stroke()
+        sx, sy = defl if defl is not None else self.stick
+        kx, ky = cx + sx * R * 0.55, cy + sy * R * 0.55
+        cr.new_path(); cr.arc(kx, ky, R * 0.42, 0, 2 * math.pi)
+        if active:
+            cr.set_source_rgb(0.25, 0.55, 0.95); cr.fill()
+        else:
+            cr.set_source_rgb(0.55, 0.57, 0.65); cr.stroke()
+
+    def draw_dpad(self, cr, x, y, d):
+        """D-pad: a cross; the pressed arms light up; a small arrow in each arm"""
+        a = d / 3                              # the cross as an outline on black; pressed arms fill blue
+        hx, hy = self.dpad
+        cr.set_source_rgb(0.25, 0.55, 0.95)
+        if hx < 0: cr.rectangle(x, y + a, a, a)
+        if hx > 0: cr.rectangle(x + 2 * a, y + a, a, a)
+        if hy < 0: cr.rectangle(x + a, y, a, a)
+        if hy > 0: cr.rectangle(x + a, y + 2 * a, a, a)
+        cr.fill()
+        cr.new_path()                          # cross outline: 12 corners
+        for px, py in ((a, 0), (2 * a, 0), (2 * a, a), (d, a), (d, 2 * a), (2 * a, 2 * a), (2 * a, d), (a, d),
+                       (a, 2 * a), (0, 2 * a), (0, a), (a, a)):
+            cr.line_to(x + px, y + py)
+        cr.close_path(); cr.set_source_rgb(0.38, 0.40, 0.46); cr.set_line_width(1.5); cr.stroke()
+        cr.set_source_rgb(0.92, 0.93, 0.95); t = a * 0.28; c = x + d / 2
+        for (ax, ay, ux, uy) in ((c, y + a / 2, 0, -1), (c, y + d - a / 2, 0, 1), (x + a / 2, c - x + y, -1, 0), (x + d - a / 2, c - x + y, 1, 0)):
+            cr.move_to(ax + ux * t, ay + uy * t)
+            cr.line_to(ax - ux * t * 0.6 + uy * t, ay - uy * t * 0.6 + ux * t)
+            cr.line_to(ax - ux * t * 0.6 - uy * t, ay - uy * t * 0.6 - ux * t)
+            cr.close_path()
+        cr.fill()
+
+    def draw_icon(self, cr, x, y, w, h, what):
+        """a small line-art symbol centred in the box: 'pad' = a gamepad, 'keys' = a keyboard"""
+        s = min(w, h) * 0.62; cx, cy = x + w / 2, y + h / 2
+        cr.save(); cr.set_source_rgb(0.92, 0.93, 0.95); cr.set_line_width(max(1.5, s * 0.06))
+        def rrect(x0, y0, ww, hh, r):
+            cr.new_sub_path()
+            cr.arc(x0 + ww - r, y0 + r, r, -math.pi / 2, 0); cr.arc(x0 + ww - r, y0 + hh - r, r, 0, math.pi / 2)
+            cr.arc(x0 + r, y0 + hh - r, r, math.pi / 2, math.pi); cr.arc(x0 + r, y0 + r, r, math.pi, 1.5 * math.pi)
+            cr.close_path()
+        if what == "enter":            # Enter: the return arrow (down, then left, with an arrowhead)
+            r = s * 0.5
+            cr.move_to(cx + r, cy - r * 0.7); cr.line_to(cx + r, cy + r * 0.2); cr.line_to(cx - r * 0.75, cy + r * 0.2)
+            cr.stroke()
+            cr.move_to(cx - r, cy + r * 0.2); cr.line_to(cx - r * 0.55, cy - r * 0.15); cr.line_to(cx - r * 0.55, cy + r * 0.55)
+            cr.close_path(); cr.fill()
+        elif what == "phone":          # back to the phone GUI: a smartphone (body, screen, home bar)
+            pw, ph = s * 0.62, s * 1.15
+            x0, y0 = cx - pw / 2, cy - ph / 2
+            rrect(x0, y0, pw, ph, pw * 0.18); cr.stroke()
+            cr.rectangle(x0 + pw * 0.14, y0 + ph * 0.12, pw * 0.72, ph * 0.66); cr.stroke()
+            cr.move_to(cx - pw * 0.15, y0 + ph * 0.89); cr.line_to(cx + pw * 0.15, y0 + ph * 0.89); cr.stroke()
+        elif what in ("lock", "unlock"):       # the touchpad lock: a padlock, closed = touchpad off (orange)
+            bw, bh = s * 0.72, s * 0.52; x0, y0 = cx - bw / 2, cy - bh * 0.15
+            if what == "lock": cr.save(); cr.set_source_rgb(1.0, 0.55, 0.1)
+            rrect(x0, y0, bw, bh, bw * 0.12); cr.fill()
+            sx = cx if what == "lock" else cx + bw * 0.28          # the shackle: on the body, or swung open
+            cr.new_path(); cr.arc(sx, y0, bw * 0.3, math.pi, 2 * math.pi)
+            if what == "lock": cr.line_to(sx + bw * 0.3, y0)
+            cr.stroke()
+            if what == "lock": cr.restore()
+        elif what == "select":         # Select / View: two overlapping windows
+            q = s * 0.42
+            rrect(cx - q * 0.9, cy - q * 0.75, q * 1.2, q * 0.95, q * 0.15); cr.stroke()
+            rrect(cx - q * 0.3, cy - q * 0.2, q * 1.2, q * 0.95, q * 0.15); cr.stroke()
+        elif what == "start":          # Start / Menu: three lines
+            q = s * 0.42
+            for dy in (-0.45, 0, 0.45):
+                cr.move_to(cx - q, cy + dy * q); cr.line_to(cx + q, cy + dy * q)
+            cr.stroke()
+        elif what in ("touch", "touch-off"):   # the touchpad screen: a screen with a fingertip; off = struck through
+            sw, sh = s * 0.75, s * 1.1; x0, y0 = cx - sw / 2, cy - sh / 2
+            rrect(x0, y0, sw, sh, sw * 0.15); cr.stroke()
+            cr.new_path(); cr.arc(cx, cy + sh * 0.08, s * 0.14, 0, 2 * math.pi); cr.fill()
+            if what == "touch-off":
+                cr.save(); cr.set_source_rgb(1.0, 0.55, 0.1)
+                cr.move_to(x0 - s * 0.12, y0 + sh + s * 0.08); cr.line_to(x0 + sw + s * 0.12, y0 - s * 0.08); cr.stroke()
+                cr.restore()
+        elif what == "swap":           # keyboard <-> desktop screen (above / below in laptop posture): up + down arrows
+            r = s * 0.5
+            for xx, d in ((cx - r * 0.35, -1), (cx + r * 0.35, 1)):
+                cr.move_to(xx, cy - r * d); cr.line_to(xx, cy + r * d); cr.stroke()
+                cr.move_to(xx, cy + r * d); cr.line_to(xx - r * 0.3, cy + r * d * 0.55); cr.line_to(xx + r * 0.3, cy + r * d * 0.55)
+                cr.close_path(); cr.fill()
+        elif what == "flip":           # both screens upside down: a half-turn arrow
+            r = s * 0.42
+            oy = cy - r * 0.27                 # the half circle runs through the bottom: lift it so it sits centred
+            cr.arc(cx, oy, r, 0.15 * math.pi, 1.15 * math.pi); cr.stroke()
+            ax, ay = cx + r * math.cos(0.15 * math.pi), oy + r * math.sin(0.15 * math.pi)
+            cr.move_to(ax + r * 0.38, ay - r * 0.05); cr.line_to(ax - r * 0.12, ay - r * 0.35); cr.line_to(ax - r * 0.05, ay + r * 0.3)
+            cr.close_path(); cr.fill()
+        elif what in ("screens", "screens-tv"):   # a monitor + the phone: mirror = both, TV only = the phone crossed out
+            mw, mh = s * 1.1, s * 0.72; x0, y0 = cx - mw * 0.62, cy - mh * 0.62
+            rrect(x0, y0, mw, mh, s * 0.06); cr.stroke()
+            cr.move_to(x0 + mw * 0.32, y0 + mh + s * 0.14); cr.line_to(x0 + mw * 0.68, y0 + mh + s * 0.14); cr.stroke()
+            pw, ph = s * 0.34, s * 0.58; px, py = cx + s * 0.22, cy - s * 0.02
+            cr.save(); cr.set_source_rgb(0, 0, 0); cr.rectangle(px - s * 0.05, py - s * 0.05, pw + s * 0.1, ph + s * 0.1)
+            cr.fill(); cr.restore()
+            rrect(px, py, pw, ph, pw * 0.2); cr.stroke()
+            if what == "screens-tv":
+                cr.save(); cr.set_source_rgb(1.0, 0.55, 0.1)
+                cr.move_to(px - s * 0.08, py + ph + s * 0.08); cr.line_to(px + pw + s * 0.08, py - s * 0.08); cr.stroke()
+                cr.restore()
+        elif what == "mic":            # voice to text: a microphone (capsule, cradle, stem)
+            mw, mh = s * 0.42, s * 0.75
+            rrect(cx - mw / 2, cy - s * 0.62, mw, mh, mw / 2); cr.fill()
+            cr.arc(cx, cy - s * 0.12, s * 0.38, 0.1 * math.pi, 0.9 * math.pi); cr.stroke()
+            cr.move_to(cx, cy + s * 0.26); cr.line_to(cx, cy + s * 0.45)
+            cr.move_to(cx - s * 0.2, cy + s * 0.45); cr.line_to(cx + s * 0.2, cy + s * 0.45); cr.stroke()
+        elif what in ("mouse", "mouse-l"):   # a mouse with the right (or left) button orange
+            mw, mh = s * 0.75, s * 1.15
+            x0, y0 = cx - mw / 2, cy - mh / 2
+            rrect(x0, y0, mw, mh, mw * 0.45); cr.stroke()
+            # the button (upper quarter) filled orange, inside the outline
+            cr.save(); rrect(x0, y0, mw, mh, mw * 0.45); cr.clip()
+            cr.set_source_rgb(1.0, 0.55, 0.1)
+            cr.rectangle(cx if what == "mouse" else x0, y0, mw / 2, mh * 0.42); cr.fill(); cr.restore()
+            cr.move_to(cx, y0); cr.line_to(cx, y0 + mh * 0.42)                      # split between the buttons
+            cr.move_to(x0, y0 + mh * 0.42); cr.line_to(x0 + mw, y0 + mh * 0.42); cr.stroke()
+        elif what == "pad":
+            bw, bh = s * 1.7, s * 0.95
+            rrect(cx - bw / 2, cy - bh / 2, bw, bh, bh * 0.45); cr.stroke()
+            # D-pad (left) and four buttons (right)
+            dx, d = cx - bw * 0.25, s * 0.13
+            cr.rectangle(dx - d * 1.5, cy - d / 2, d * 3, d); cr.rectangle(dx - d / 2, cy - d * 1.5, d, d * 3); cr.fill()
+            bx, r = cx + bw * 0.25, s * 0.07
+            for ox, oy in ((0, -2.2), (2.2, 0), (0, 2.2), (-2.2, 0)):
+                cr.arc(bx + ox * r, cy + oy * r, r, 0, 2 * math.pi); cr.fill()
+        else:
+            bw, bh = s * 1.8, s * 0.9
+            rrect(cx - bw / 2, cy - bh / 2, bw, bh, s * 0.1); cr.stroke()
+            kw, kh = bw / 10.5, bh / 5.5
+            for row in range(3):
+                for col in range(8):
+                    cr.rectangle(cx - bw / 2 + kw * (0.9 + col * 1.15), cy - bh / 2 + kh * (0.8 + row * 1.2), kw * 0.8, kh * 0.75)
+            cr.rectangle(cx - bw * 0.25, cy - bh / 2 + kh * 4.4, bw * 0.5, kh * 0.6)   # space bar
+            cr.fill()
+        cr.restore()
+
+    # ---- input (touch sequences; a mouse/pointer press works too)
+    def on_event(self, ctrl, ev):
+        # PyGObject (pmOS v25.06) passes None for the event argument of EventControllerLegacy::event - every touch
+        # raised AttributeError and the app never reacted (reported 2026-11-06: "touch on the keyboard doesn't work").
+        # The controller still knows the event it is dispatching.
+        if ev is None:
+            ev = ctrl.get_current_event()
+            if ev is None:
+                return False
+        t = ev.get_event_type()
+        if DEBUG and t not in (Gdk.EventType.MOTION_NOTIFY, Gdk.EventType.TOUCH_UPDATE):
+            pos = ev.get_position()
+            print("ev", t.value_nick, pos, "area", self.area.get_width(), self.area.get_height(), flush=True)
+        if t in (Gdk.EventType.TOUCH_BEGIN, Gdk.EventType.BUTTON_PRESS):
+            ok, px, py = ev.get_position(); self.t_begin(ev.get_event_sequence(), px, py)
+        elif t in (Gdk.EventType.TOUCH_UPDATE, Gdk.EventType.MOTION_NOTIFY):
+            ok, px, py = ev.get_position()
+            if not self.t_move(ev.get_event_sequence(), px, py): return False
+        elif t in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL, Gdk.EventType.BUTTON_RELEASE):
+            self.t_end(ev.get_event_sequence())
+        else:
+            return False
+        return True
+
+    # touch handling shared by the GTK events (Phosh) and the raw digitizer (desktop); px, py = window coordinates
+    def t_begin(self, seq, px, py):
+        it = self.hit(*self.to_frame(px, py))
+        if DEBUG: print("  frame", self.to_frame(px, py), "hit", it and it[:3], flush=True)
+        if it:
+            if it[0] == "stickzone":                     # the stick's centre = where the thumb landed
+                fx, fy = self.to_frame(px, py); w, h0 = self.frame()
+                self.stick_origin = getattr(self, "stick_origin", None) or {}
+                self.stick_origin[it[1]] = (fx, fy, STICK_R * h0)
+            self.touch[seq] = it; self.press(it)
+            if it[0] in ("stickzone", "dpad"): self.drag(it, *self.to_frame(px, py))
+        self.area.queue_draw()
+    def t_move(self, seq, px, py):
+        it = self.touch.get(seq)                  # the finger that grabbed the stick / D-pad keeps it
+        if not it or it[0] not in ("stickzone", "dpad"):
+            return False
+        self.drag(it, *self.to_frame(px, py)); return True
+    def t_end(self, seq):
+        it = self.touch.pop(seq, None)
+        if it: self.release(it)
+        self.area.queue_draw()
+
+    # ---- RAW touch in the desktop session: labwc turned taps on the keyboard screen into pointer moves (the pointer
+    # jumped onto the keyboard and the Right click landed there - seen 2026-11-06, twice, even with
+    # mouseEmulation="no"). So the app GRABS the keyboard screen's digitizer (like hingeboard-touchpad does on the other
+    # screen): the compositor never sees these touches. Raw -> screen = the panel's calibration (x' = 1 - y,
+    # y' = 1 - x, as libinput's CAL "0 -1 1 -1 0 1"); the window covers the whole (portrait, unrotated) output.
+    def raw_touch_start(self, name=os.environ.get("HINGEBOARD_RAW_TOUCH", "IPTSD Virtual Touchscreen 045E:0C02")):
+        # the keyboard screen's own touchscreen (hingeboard-session passes it for the current layout: after a swap it
+        # is the other screen's)
+        for p in evdev.list_devices():
+            d = evdev.InputDevice(p)
+            if d.name == name: break
+        else:
+            print("raw touch: no", name, flush=True); return False
+        d.grab(); self.rdev = d
+        ax, ay = d.absinfo(E.ABS_MT_POSITION_X), d.absinfo(E.ABS_MT_POSITION_Y)
+        self.rrange = (ax.min, ax.max - ax.min or 1, ay.min, ay.max - ay.min or 1)
+        self.rslots, self.rslot, self.rdirty = {}, 0, set()
+        GLib.io_add_watch(d.fd, GLib.IO_IN, self.on_raw)
+        print("raw touch: grabbed", d.path, flush=True); return True
+
+    def on_raw(self, fd, cond):
+        try:
+            evs = list(self.rdev.read())
+        except BlockingIOError:
+            return True
+        for ev in evs:
+            if ev.type == E.EV_ABS:
+                if ev.code == E.ABS_MT_SLOT: self.rslot = ev.value
+                elif ev.code == E.ABS_MT_TRACKING_ID:
+                    if ev.value < 0:
+                        if self.rslot in self.rslots: self.rslots[self.rslot][3] = "up"; self.rdirty.add(self.rslot)
+                    else:
+                        self.rslots[self.rslot] = [None, None, ev.value, "new"]; self.rdirty.add(self.rslot)
+                elif ev.code in (E.ABS_MT_POSITION_X, E.ABS_MT_POSITION_Y) and self.rslot in self.rslots:
+                    self.rslots[self.rslot][0 if ev.code == E.ABS_MT_POSITION_X else 1] = ev.value
+                    self.rdirty.add(self.rslot)
+            elif ev.type == E.EV_SYN and ev.code == E.SYN_REPORT:
+                W, H = self.area.get_width(), self.area.get_height(); x0, xs, y0, ys = self.rrange
+                for s in list(self.rdirty):
+                    st = self.rslots.get(s)
+                    if not st: continue
+                    seq = ("raw", st[2])
+                    if st[3] == "up":
+                        self.t_end(seq); del self.rslots[s]; continue
+                    if st[0] is None or st[1] is None: continue
+                    nx, ny = (st[0] - x0) / xs, (st[1] - y0) / ys
+                    px, py = (1 - ny) * W, (1 - nx) * H
+                    if st[3] == "new": st[3] = "down"; self.t_begin(seq, px, py)
+                    else: self.t_move(seq, px, py)
+                self.rdirty.clear()
+        return True
+
+    # ---- voice to text: the mic key starts/stops hingeboard-dictate.py; finished phrases are typed into the focused app
+    def dictate(self):
+        if getattr(self, "dict_proc", None):
+            self.dict_proc.terminate(); return          # its final phrase still arrives, then EOF ends it
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.dict_proc = subprocess.Popen([sys.executable, os.path.join(here, "hingeboard-dictate.py")],
+                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.dict_state = "loading"; self.dict_first = True
+        GLib.io_add_watch(self.dict_proc.stdout, GLib.IO_IN | GLib.IO_HUP, self.on_dictate)
+        self.area.queue_draw()
+
+    def on_dictate(self, src, cond):
+        line = src.readline()
+        if not line:                                     # helper ended
+            self.dict_proc = None; self.dict_state = None; self.area.queue_draw(); return False
+        tag, _, text = line.rstrip("\n").partition(" ")
+        if tag == "READY": self.dict_state = "listening"
+        elif tag == "TEXT" and text:
+            self.type_text(("" if self.dict_first else " ") + text); self.dict_first = False
+        self.area.queue_draw(); return True
+
+    def type_text(self, s):
+        for ch in s:
+            code = CHARKEY.get(ch.lower())
+            if code is None: continue
+            shift = ch.isupper()
+            if shift: kbd.write(E.EV_KEY, K.KEY_LEFTSHIFT, 1)
+            kbd.write(E.EV_KEY, code, 1); kbd.syn(); kbd.write(E.EV_KEY, code, 0)
+            if shift: kbd.write(E.EV_KEY, K.KEY_LEFTSHIFT, 0)
+            kbd.syn()
+
+    def press(self, it):
+        kind, code = it[0], it[1]
+        if code == "mic":
+            self.dictate(); return
+        if kind == "key":
+            if code in MODS:
+                self.latched ^= {code}; return
+            if code == K.KEY_CAPSLOCK:
+                self.caps = not self.caps
+            for m in self.latched: kbd.write(E.EV_KEY, m, 1)
+            kbd.write(E.EV_KEY, code, 1); kbd.syn()
+            it_repeat = GLib.timeout_add(450, self.repeat_start, code)
+            self.rep = (code, it_repeat)
+        elif kind == "dir":
+            self.dirs = getattr(self, "dirs", set()) | {code}; self.dir_update()
+        elif kind in ("pad", "rect"):
+            if isinstance(code, tuple): pad.write(E.EV_ABS, code[1], code[2])
+            else: pad.write(E.EV_KEY, code, 1)
+            pad.syn()
+        elif kind == "bar" and code == "enter":
+            kbd.write(E.EV_KEY, K.KEY_ENTER, 1); kbd.syn()
+        elif kind == "bar" and code in ("lclick", "rclick"):   # mouse button down at the pointer, held while the finger is
+            mouse.write(E.EV_KEY, K.BTN_LEFT if code == "lclick" else K.BTN_RIGHT, 1); mouse.syn()
+
+    def poll_windows(self):
+        """the open windows for the window row: lswt (wlr-foreign-toplevel); its 'identifier' is not quoted, so the
+        output is not strict JSON - read title / app-id with a pattern"""
+        try:
+            out = subprocess.run(["lswt", "-j"], capture_output=True, text=True, timeout=3).stdout
+            wins = [(t, a) for t, a in re.findall(r'"title":\s*"((?:[^"\\]|\\.)*)",\s*"app-id":\s*"((?:[^"\\]|\\.)*)"', out)]
+        except Exception:
+            wins = []
+        if wins != getattr(self, "windows", None):
+            self.windows = wins; self.area.queue_draw()
+        return True
+
+    def confirm_timeout(self):
+        if getattr(self, "confirm", False):
+            self.confirm = False; self.area.queue_draw()
+        return False
+
+    def drag(self, it, fx, fy):
+        """thumbstick: deflection from the ring's centre -> ABS_X/ABS_Y (full range at the ring edge, clamped);
+        D-pad: direction from the cross's centre -> hat, 8 ways (a component counts when it is >= 40 % of the larger)"""
+        kind, _, _, x, y, w, h = it
+        if kind == "stickzone":
+            ox, oy, R = self.stick_origin[it[1]]; dx, dy = (fx - ox) / R, (fy - oy) / R
+        else:
+            R = w / 2; dx, dy = (fx - (x + R)) / R, (fy - (y + R)) / R
+        if kind == "stickzone":
+            m = math.hypot(dx, dy)
+            if m > 1: dx, dy = dx / m, dy / m
+            self.stick = (dx, dy)
+            ax, ay = STICK_AXES[it[1]]; self.sticks[it[1]] = (dx, dy)
+            pad.write(E.EV_ABS, ax, int(dx * 32767)); pad.write(E.EV_ABS, ay, int(dy * 32767)); pad.syn()
+        else:
+            m = max(abs(dx), abs(dy))
+            if m < 0.18:
+                hx = hy = 0                     # dead zone in the middle of the cross
+            else:
+                hx = (dx >= 0.4 * m) - (dx <= -0.4 * m); hy = (dy >= 0.4 * m) - (dy <= -0.4 * m)
+            if (hx, hy) != self.dpad:
+                self.dpad_arrows(hx, hy)
+                self.dpad = (hx, hy)
+                if PAD_HAT:
+                    pad.write(E.EV_ABS, K.ABS_HAT0X, hx); pad.write(E.EV_ABS, K.ABS_HAT0Y, hy); pad.syn()
+        self.area.queue_draw()
+
+    def dir_update(self):
+        """the held direction circles -> one direction (arrow keys, and the hat with HINGEBOARD_PAD_HAT)"""
+        hx = max(-1, min(1, sum(d[0] for d in self.dirs))); hy = max(-1, min(1, sum(d[1] for d in self.dirs)))
+        if (hx, hy) != self.dpad:
+            self.dpad_arrows(hx, hy); self.dpad = (hx, hy)
+            if PAD_HAT:
+                pad.write(E.EV_ABS, K.ABS_HAT0X, hx); pad.write(E.EV_ABS, K.ABS_HAT0Y, hy); pad.syn()
+
+    def dpad_arrows(self, hx, hy):
+        """the D-pad ALSO presses the arrow keys (2026-11-06: in GZDoom 'left right go up down' although the hat
+        is right - HAT0X -1/+1 for left/right, verified on the device; Doom binds the arrows to move/turn by default)"""
+        old = {(-1, 0): K.KEY_LEFT, (1, 0): K.KEY_RIGHT, (0, -1): K.KEY_UP, (0, 1): K.KEY_DOWN}
+        def keys(x, y): return {k for (dx, dy), k in old.items() if (dx and dx == x) or (dy and dy == y)}
+        before, after = keys(*self.dpad), keys(hx, hy)
+        for k in before - after: kbd.write(E.EV_KEY, k, 0)
+        for k in after - before: kbd.write(E.EV_KEY, k, 1)
+        kbd.syn()
+
+    def repeat_start(self, code):
+        self.rep = (code, GLib.timeout_add(45, self.repeat_tick, code)); return False
+    def repeat_tick(self, code):
+        kbd.write(E.EV_KEY, code, 2); kbd.syn(); return True
+
+    def release(self, it):
+        kind, code = it[0], it[1]
+        if code == "mic":
+            return
+        if kind == "key" and code not in MODS:
+            if getattr(self, "rep", None): GLib.source_remove(self.rep[1]); self.rep = None
+            kbd.write(E.EV_KEY, code, 0)
+            for m in self.latched: kbd.write(E.EV_KEY, m, 0)
+            kbd.syn(); self.latched = set()
+        elif kind == "dir":
+            self.dirs = getattr(self, "dirs", set()) - {code}; self.dir_update()
+        elif kind in ("pad", "rect"):
+            if isinstance(code, tuple): pad.write(E.EV_ABS, code[1], 0)
+            else: pad.write(E.EV_KEY, code, 0)
+            pad.syn()
+        elif kind == "stickzone":             # spring back to the centre
+            self.stick = (0.0, 0.0); self.sticks.pop(code, None); (getattr(self, "stick_origin", None) or {}).pop(code, None)
+            ax, ay = STICK_AXES[code]
+            pad.write(E.EV_ABS, ax, 0); pad.write(E.EV_ABS, ay, 0); pad.syn()
+        elif kind == "dpad":
+            self.dpad_arrows(0, 0)
+            self.dpad = (0, 0)
+            if PAD_HAT:
+                pad.write(E.EV_ABS, K.ABS_HAT0X, 0); pad.write(E.EV_ABS, K.ABS_HAT0Y, 0); pad.syn()
+        elif kind == "win":                   # focus that window (wlrctl, wlr-foreign-toplevel)
+            if 0 <= code < len(getattr(self, "windows", [])):
+                title, app = self.windows[code]
+                args = ["wlrctl", "toplevel", "focus"] + (["app_id:" + app] if app else []) + (["title:" + title] if title else [])
+                try: subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError: pass
+        elif kind == "confirm":
+            self.confirm = False
+            if code == "yes": self.quit(switch=True)
+        elif kind == "bar":
+            # switches (keys/gamepad, swap, flip, screens): a quick second tap must not undo the first
+            if code in ("toggle", "swap", "flip", "screens", "notouch"):
+                now = time.monotonic(); last = getattr(self, "bar_last", {})
+                if now - last.get(code, 0) < 1.5:
+                    return
+                last[code] = now; self.bar_last = last
+            if code in ("lclick", "rclick"):
+                mouse.write(E.EV_KEY, K.BTN_LEFT if code == "lclick" else K.BTN_RIGHT, 0); mouse.syn()
+            elif code == "enter":
+                kbd.write(E.EV_KEY, K.KEY_ENTER, 0); kbd.syn()
+            elif code == "exit":
+                # "are you sure" first (request 2026-11-06: "i clicked phone by accident ... that might need a are you
+                # sure pannel"); it cancels itself after 6 s
+                self.confirm = True
+                GLib.timeout_add(6000, self.confirm_timeout)
+            elif code == "toggle":
+                self.mode = "pad" if self.mode == "keys" else "keys"
+                if self.mode == "keys" and getattr(self, "notouch", False):
+                    self.set_notouch(False)       # back to typing = the touchpad screen works again
+            elif code == "notouch":
+                self.set_notouch(not getattr(self, "notouch", False))
+            elif code in ("swap", "flip"):
+                # the new layout restarts this keyboard on its new screen: run it outside this process
+                try:
+                    subprocess.Popen(["hingeboard-session", "layout", code], start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError:
+                    pass
+            elif code == "screens":
+                try:
+                    subprocess.Popen(["hingeboard-session", "screens", "toggle"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError:
+                    pass
+                GLib.timeout_add(1500, lambda: (self.area.queue_draw(), False)[1])
+
+    # ---- ONE DISPLAY while the keyboard is on (request 2026-11-06: "disable the screen functionality of the other
+    # screen because it is a perma keyboard"; "the right screen should only be landscape when the keyboard is online").
+    # hingeboard-display-mode keyboard = the OTHER screen becomes Phosh's primary display (top bar, home, app grid, apps) in
+    # landscape; phone = back to normal (two steps: phosh 0.47 segfaults if its primary changes rotation). The flag file
+    # tells other tools (edge gestures, window movers) that the keyboard owns this screen (move nothing onto it).
+    def display_mode(self, mode):
+        if IN_DESKTOP:      # the labwc desktop session sets its own outputs (autostart); nothing to switch here
+            return
+        try:
+            subprocess.run(["sh", "/usr/local/bin/hingeboard-display-mode", mode], capture_output=True, timeout=15)
+        except Exception as ex:
+            print("display mode", mode, "failed:", ex, flush=True)
+        try:
+            if mode == "keyboard": open(ACTIVE_FLAG, "w").close()
+            else: os.unlink(ACTIVE_FLAG)
+        except OSError:
+            pass
+
+    def quit(self, switch=False):
+        if getattr(self, "quitting", False): return
+        self.quitting = True
+        if getattr(self, "dict_proc", None): self.dict_proc.terminate()
+        # laptop mode ends = back to the Phosh phone session (session switching was chosen) - ONLY on the Phone
+        # button: a SIGTERM comes from a session switch already in progress, and switching again from here raced it
+        # (2026-11-06: 'desktop' restart -> SIGTERM -> 'phone' -> the phone landed in Phosh)
+        if IN_DESKTOP and switch:
+            subprocess.Popen(["doas", "/usr/local/bin/hingeboard-session", "phone"])
+        self.display_mode("phone")
+        kbd.close(); pad.close(); self.close()
+
+
+def activate(app):
+    win = App(app)
+    LS.init_for_window(win); LS.set_layer(win, LS.Layer.OVERLAY); LS.set_namespace(win, "hingeboard")
+    for edge in (LS.Edge.TOP, LS.Edge.BOTTOM, LS.Edge.LEFT, LS.Edge.RIGHT): LS.set_anchor(win, edge, True)
+    LS.set_exclusive_zone(win, -1)                         # cover everything on that screen, even Phosh's bars
+    LS.set_keyboard_mode(win, LS.KeyboardMode.NONE)        # never take keyboard focus: keys go to the other app
+    mons = Gdk.Display.get_default().get_monitors()
+    mon = next((mons.get_item(i) for i in range(mons.get_n_items()) if mons.get_item(i).get_connector() == OUT), None)
+    if mon: LS.set_monitor(win, mon)
+    win.present()
+    win.display_mode("keyboard")
+    if IN_DESKTOP and not os.environ.get("HINGEBOARD_NO_RAW"):
+        win.raw_touch_start()
+    if KB_WINDOWS:
+        win.poll_windows(); GLib.timeout_add(2000, win.poll_windows)
+
+app = Gtk.Application(application_id="org.hingeboard.Hingeboard")
+app.connect("activate", activate)
+def on_term(*_):                      # SIGTERM/SIGINT: same clean exit as the Exit key (phone mode back, devices closed)
+    for w in app.get_windows():
+        if isinstance(w, App): w.quit()
+    app.quit(); return GLib.SOURCE_REMOVE
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, on_term)
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, on_term)
+app.run([])
