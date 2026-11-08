@@ -17,8 +17,9 @@ names and touch devices are settings, so other dual-screen devices can use it.
   - Microphone key: offline dictation with Vosk (`hingeboard-dictate.py`); nothing leaves the device.
   - Top bar: left click, right click, microphone and a **settings** button. Settings opens the rarer buttons in the
     same bar (gamepad, swap, flip, screens, media, phone/exit) and hides the click and microphone buttons; tap it
-    again to close. **Media** turns the bar into player controls: previous, play/pause, next (any MPRIS player, via
-    playerctl) and volume down / up (PipeWire, via wpctl).
+    again to close (the cog keeps its place). **Media** replaces the keyboard, like the gamepad, with big player
+    buttons: previous, play/pause, next (any MPRIS player, via playerctl), volume down / up (PipeWire, via wpctl) and
+    a keyboard button back.
   - Exit puts both screens back to phone mode.
 - **Display modes** (`hingeboard-display-mode keyboard|phone`): while the keyboard runs, the other screen becomes
   Phosh's primary display in landscape.
