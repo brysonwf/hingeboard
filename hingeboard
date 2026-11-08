@@ -371,6 +371,16 @@ class App(Gtk.ApplicationWindow):
             if kind == "bar" and code in ("toggle", "rclick"):
                 self.draw_icon(cr, x, y, iw, ih, "mouse" if code == "rclick" else "pad" if self.mode == "keys" else "keys")
                 continue
+            if kind == "dir":                            # the D-pad: a drawn triangle (2026-11-08: Debian's Noto Sans
+                hx, hy = code                            # has no U+25B2..25C0 - the glyphs showed as boxes)
+                cx, cy, r = x + iw / 2, y + ih / 2, min(iw, ih) * 0.22
+                cr.set_source_rgb(*((0.62, 0.63, 0.66) if not down else (0.92, 0.93, 0.95)))
+                px, py = -hy, hx                         # perpendicular to the direction
+                cr.move_to(cx + hx * r, cy + hy * r)
+                cr.line_to(cx - hx * r * 0.7 + px * r * 0.9, cy - hy * r * 0.7 + py * r * 0.9)
+                cr.line_to(cx - hx * r * 0.7 - px * r * 0.9, cy - hy * r * 0.7 - py * r * 0.9)
+                cr.close_path(); cr.fill()
+                continue
             text = lab
             if kind == "key" and len(lab) == 1:
                 up = self.caps != bool(self.latched & {K.KEY_LEFTSHIFT, K.KEY_RIGHTSHIFT})
