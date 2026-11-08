@@ -50,6 +50,7 @@ Debian (trixie or newer, tested with Plasma Mobile on the Surface Duo):
     apt install python3-gi python3-gi-cairo python3-cairo python3-evdev gir1.2-gtk-4.0 \
         gir1.2-gtk4layershell-1.0 libgtk4-layer-shell0 wlr-randr opendoas playerctl
     apt install labwc lxqt-panel pcmanfm-qt wl-mirror gvfs                     # laptop session
+    apt install lxqt-powermanagement nm-tray blueman                           # tray: battery, Wi-Fi, Bluetooth
 
 (lxqt-panel 2.1, as in trixie, places itself by screen index (`desktop=`) rather than `screen-name`; install.sh and
 the session write both.)
