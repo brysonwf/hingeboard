@@ -30,7 +30,8 @@ id_of() { echo "$1" | grep -o '[0-9A-Fa-f]\{4\}:[0-9A-Fa-f]\{4\}' | tail -1; }
 # labwc's config (Hingeboard's own dir, -C): the template from install.sh with the keyboard screen's touch mapping
 labwc_conf() {
 	mkdir -p $RUN/hingeboard-labwc
-	sed -e "s|@KB_TOUCH@|$KB_TOUCH|" -e "s|@KB_OUT@|$KB|" /usr/local/share/hingeboard/labwc/rc.xml > $RUN/hingeboard-labwc/rc.xml
+	sed -e "s|@KB_TOUCH@|$KB_TOUCH|" -e "s|@KB_OUT@|$KB|" -e "s|@DESK_TOUCH@|$DESK_TOUCH|" -e "s|@DESK_OUT@|$DESK|" \
+		/usr/local/share/hingeboard/labwc/rc.xml > $RUN/hingeboard-labwc/rc.xml
 }
 
 case "$1" in
@@ -81,6 +82,10 @@ autostart)
 	"$0" layout apply > /tmp/hingeboard-layout.log 2>&1
 	pcmanfm-qt --desktop --profile=lxqt > /dev/null 2>&1 &
 	lxqt-powermanagement > /dev/null 2>&1 &
+	# the tray: every device (request 2026-11-08: "all the devices should be in the tray") - battery
+	# (lxqt-powermanagement), Wi-Fi (nm-tray), Bluetooth (blueman-applet); volume + drives are panel plugins
+	command -v nm-tray > /dev/null && nm-tray > /dev/null 2>&1 &
+	command -v blueman-applet > /dev/null && blueman-applet > /dev/null 2>&1 &
 	"$0" screens watch > /tmp/hingeboard-screens.log 2>&1 & ;;
 layout)
 	layout
@@ -118,7 +123,21 @@ layout)
 		setsid hingeboard > /tmp/hingeboard.log 2>&1 < /dev/null &
 	sleep 1
 	setsid lxqt-panel > /dev/null 2>&1 < /dev/null &
-	setsid "$0" touchpad-loop "$(id_of "$DESK_TOUCH")" $DESK_T > /dev/null 2>&1 < /dev/null & ;;
+	# the desktop screen's touch: the touchpad (default) or plain touch ("$0 touch toggle", remembered)
+	[ "$(cat $RUN/hingeboard-touch 2>/dev/null)" = direct ] ||
+		setsid "$0" touchpad-loop "$(id_of "$DESK_TOUCH")" $DESK_T > /dev/null 2>&1 < /dev/null & ;;
+touch)
+	# request 2026-11-08: "settings needs a button to switch from touchpad mode to reg touch mode". touchpad = our
+	# touchpad grabs the desktop screen's touchscreen (relative pointer); direct = it lets go and labwc gets plain touch
+	T=$RUN/hingeboard-touch; cur=$(cat $T 2>/dev/null || echo pad)
+	case "$2" in pad|direct) new=$2 ;; *) [ $cur = pad ] && new=direct || new=pad ;; esac
+	echo $new > $T
+	layout; labwc_conf; kill -HUP ${LABWC_PID:-$(pidof labwc)} 2> /dev/null   # labwc maps the screen's touch to it
+	pkill -f "hingeboard-session touchpad-loop"; pkill -f "hingeboard-touchpad.py"
+	if [ $new = pad ]; then
+		setsid "$0" touchpad-loop "$(id_of "$DESK_TOUCH")" $DESK_T > /dev/null 2>&1 < /dev/null &
+	fi
+	echo "$(date +%T) touch: $new" ;;
 touchpad-loop)
 	# the desktop screen's touch = the touchpad; restarted if it ever dies (a crash would leave no pointer)
 	D=${2#*:}

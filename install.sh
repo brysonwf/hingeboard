@@ -79,6 +79,8 @@ put /usr/local/share/hingeboard/labwc/rc.xml <<EOF
     <keybind key="W-0"><action name="ToggleMagnify" /></keybind>
   </keyboard>
   <touch deviceName="@KB_TOUCH@" mapToOutput="@KB_OUT@" mouseEmulation="no" />
+  <!-- the desktop screen's own touch, used when the touchpad is switched off (keyboard settings: plain touch) -->
+  <touch deviceName="@DESK_TOUCH@" mapToOutput="@DESK_OUT@" mouseEmulation="no" />
   <windowRules>
     <!-- the TV mirror (hingeboard-session screens) is not a window to switch to -->
     <windowRule identifier="at.yrlf.wl_mirror" skipTaskbar="yes" skipWindowSwitcher="yes" />
@@ -91,11 +93,13 @@ EOF
 H=$R/home/$U
 IDS=$(awk -F: -v u="$U" '$1 == u { print $3 ":" $4 }' "$R/etc/passwd")
 [ -n "$IDS" ] || { echo "no user $U in $R/etc/passwd (set HB_USER)"; exit 1; }
+# the desktop shows ONE icon, the drive view (request 2026-11-08: "can we only show a top level harddrive instead of
+# folders to various places?") - pcmanfm-qt's Computer shortcut lists the phone's drives
 mkdir -p $H/Desktop $H/Downloads $H/.config/pcmanfm-qt/lxqt $H/.config/lxqt
-ln -sfn /home/$U/Downloads $H/Desktop/Downloads
+[ -L $H/Desktop/Downloads ] && rm -f $H/Desktop/Downloads
 C=$H/.config/pcmanfm-qt/lxqt/settings.conf
-grep -q '^DesktopShortcuts' $C 2>/dev/null ||
-	printf '[Desktop]\nDesktopShortcuts=Home, Trash, Computer, Network\nWallpaperMode=stretch\nBgColor=#1f4f3a\n' >> $C
+if grep -q '^DesktopShortcuts' $C 2>/dev/null; then sed -i 's/^DesktopShortcuts=.*/DesktopShortcuts=Computer/' $C
+else printf '[Desktop]\nDesktopShortcuts=Computer\nWallpaperMode=stretch\nBgColor=#1f4f3a\n' >> $C; fi
 IT=breeze-dark; [ -f $R/usr/share/icons/linuxduobench/index.theme ] && IT=linuxduobench
 cat > $H/.config/lxqt/lxqt.conf <<EOF
 [General]
@@ -126,9 +130,11 @@ pick() { for d in "$@"; do [ -f $R/usr/share/applications/$d ] && { echo /usr/sh
 QL1=/usr/share/applications/pcmanfm-qt.desktop
 QL2=$(pick foot.desktop org.kde.konsole.desktop qterminal.desktop)
 QL3=$(pick org.gnome.Epiphany.desktop chromium.desktop firefox-esr.desktop firefox.desktop)
-# the start-menu icon: LXQt's own needs lxqt-themes; use the theme's start-here (Breeze has start-here-kde)
-MI=$(ls $R/usr/share/icons/breeze-dark/places/96/start-here-kde.svg $R/usr/share/icons/*/places/*/start-here.svg 2>/dev/null | head -1)
-MI=${MI#$R}
+# the start menu = LXQt's classic mainmenu (Debian's 2.1 fancymenu ignored icon= and drew an empty button); its icon: a
+# distribution's own (linuxduobench = the Surface Duo bench's penguin, installed by its system layer), else start-here
+MI=""; for f in $R/usr/share/icons/hicolor/128x128/apps/linuxduobench.png \
+	$R/usr/share/icons/breeze-dark/places/96/start-here-kde.svg $R/usr/share/icons/*/places/*/start-here.svg; do
+	[ -f "$f" ] && { MI=${f#$R}; break; }; done   # in this order (ls would sort them)
 cat > $H/.config/lxqt/panel.conf <<EOF
 [General]
 __userfile__=true
@@ -138,19 +144,20 @@ alignment=-1
 animation-duration=0
 desktop=${HINGEBOARD_OTHER_INDEX:-1}
 hidable=false
-iconSize=24
+iconSize=32
 lineCount=1
 lockPanel=true
-panelSize=40
-plugins=fancymenu,quicklaunch,taskbar,statusnotifier,mount,volume,worldclock,showdesktop
+panelSize=52
+plugins=mainmenu,quicklaunch,taskbar,statusnotifier,mount,volume,worldclock,showdesktop
 position=Bottom
 reserve-space=true
 screen-name=${HINGEBOARD_OTHER:-DSI-2}
 width=100
 width-percent=true
 
-[fancymenu]
-type=fancymenu
+[mainmenu]
+type=mainmenu
+ownIcon=true
 icon=$MI
 
 [quicklaunch]
