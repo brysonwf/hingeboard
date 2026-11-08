@@ -21,6 +21,13 @@ _LS = next(iter(glob.glob("/usr/lib/libgtk4-layer-shell.so.0") + glob.glob("/usr
 if _LS and _LS not in os.environ.get("LD_PRELOAD", ""):
     os.environ["LD_PRELOAD"] = (_LS + " " + os.environ.get("LD_PRELOAD", "")).strip()
     os.execv(sys.executable, [sys.executable] + sys.argv)
+# ...and only for THIS process: the preload is already in effect, so drop it from the environment the keyboard hands
+# to the programs it starts (hingeboard-session -> lxqt-panel, the tray apps ...). Inherited, it loads GTK 4 into
+# GTK 3 apps: blueman-applet died with "gdk_display_manager_get() was called before gtk_init()" (2026-11-08).
+if _LS:
+    _rest = " ".join(p for p in os.environ.get("LD_PRELOAD", "").split() if p != _LS)
+    if _rest: os.environ["LD_PRELOAD"] = _rest
+    else: os.environ.pop("LD_PRELOAD", None)
 import gi
 gi.require_version("Gtk", "4.0"); gi.require_version("Gtk4LayerShell", "1.0")
 from gi.repository import Gtk, Gdk, GLib, Gtk4LayerShell as LS
