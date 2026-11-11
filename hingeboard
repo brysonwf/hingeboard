@@ -15,9 +15,10 @@ landscape (hingeboard-display-mode keyboard); this screen is only the keyboard. 
 Run as the session user: hingeboard (it preloads gtk4-layer-shell itself).
 Needs py3-gobject3, py3-cairo, py3-evdev, gtk4-layer-shell, wlr-randr; /dev/uinput writable by the input group."""
 import glob, math, os, re, signal, subprocess, sys, time
-# gtk4-layer-shell must be loaded before libwayland-client: run again with it preloaded
-_LS = "/usr/lib/libgtk4-layer-shell.so.0"
-if os.path.exists(_LS) and _LS not in os.environ.get("LD_PRELOAD", ""):
+# gtk4-layer-shell must be loaded before libwayland-client: run again with it preloaded (Alpine: /usr/lib, Debian:
+# the multiarch dir /usr/lib/<triplet>)
+_LS = next(iter(glob.glob("/usr/lib/libgtk4-layer-shell.so.0") + glob.glob("/usr/lib/*/libgtk4-layer-shell.so.0")), "")
+if _LS and _LS not in os.environ.get("LD_PRELOAD", ""):
     os.environ["LD_PRELOAD"] = (_LS + " " + os.environ.get("LD_PRELOAD", "")).strip()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 import gi

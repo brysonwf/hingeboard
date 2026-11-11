@@ -47,10 +47,14 @@ Exec=/usr/local/bin/hingeboard-session run
 Type=Application
 EOF
 # the session user may switch sessions as root without a password - only these two commands
-put /etc/doas.d/hingeboard-session.conf <<EOF
-permit nopass $U as root cmd /usr/local/bin/hingeboard-session args desktop
-permit nopass $U as root cmd /usr/local/bin/hingeboard-session args phone
-EOF
+DOAS_RULES="permit nopass $U as root cmd /usr/local/bin/hingeboard-session args desktop
+permit nopass $U as root cmd /usr/local/bin/hingeboard-session args phone"
+if [ -x "$R/sbin/apk" ] || [ -x "$R/usr/bin/apk" ]; then          # Alpine / postmarketOS: doas reads /etc/doas.d
+	printf '%s\n' "$DOAS_RULES" | put /etc/doas.d/hingeboard-session.conf
+else                                                               # Debian's opendoas: only /etc/doas.conf
+	grep -qs 'hingeboard-session args desktop' "$R/etc/doas.conf" || printf '%s\n' "$DOAS_RULES" >> "$R/etc/doas.conf"
+	chmod 0400 "$R/etc/doas.conf"
+fi
 # labwc: a TEMPLATE - hingeboard-session fills in the keyboard screen and its touchscreen for the current layout
 # and runs labwc with that config dir. A full-screen magnifier that follows the pointer (pinch on the touchpad =
 # Super+= / Super+-); the keyboard screen's touch as a touchscreen (no mouse emulation: taps on the keyboard must not

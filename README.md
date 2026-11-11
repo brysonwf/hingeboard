@@ -40,6 +40,14 @@ postmarketOS (Alpine) with Phosh. Packages:
     apk add labwc lxqt-panel pcmanfm-qt lxqt-powermanagement breeze-icons wl-mirror   # laptop session
     apk add py3-vosk-api vosk-model-small-en-us                                # dictation (optional)
 
+Debian (trixie or newer, tested with Plasma Mobile on the Surface Duo):
+
+    apt install python3-gi python3-gi-cairo python3-cairo python3-evdev gir1.2-gtk-4.0 \
+        gir1.2-gtk4layershell-1.0 libgtk4-layer-shell0 wlr-randr opendoas
+    apt install labwc lxqt-panel pcmanfm-qt wl-mirror                          # laptop session
+
+(The keyboard preloads gtk4-layer-shell itself; on Debian the library is in the multiarch directory.)
+
 The session user must be in the `input` group (the udev rule gives it `/dev/uinput`). On the Surface Duo the
 touchscreens come from iptsd (multitouch) and the Duo's touch driver.
 
